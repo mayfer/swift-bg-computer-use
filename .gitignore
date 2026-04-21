@@ -1,0 +1,12 @@
+.build/
+.swiftpm/
+Package.resolved
+
+.DS_Store
+
+*.png
+*.jpg
+*.jpeg
+
+tmp/
+.tmp/
