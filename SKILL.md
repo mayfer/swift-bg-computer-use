@@ -61,8 +61,9 @@ For the main display:
 Virtual cursor:
 
 ```bash
-.build/release/macos-bg-cua cursor start background <wid> <x> <y>
-.build/release/macos-bg-cua cursor move <x> <y> --duration 0.18
+.build/release/macos-bg-cua cursor start background <wid> <x> <y> --duration 0.0
+.build/release/macos-bg-cua cursor move <x> <y> --duration 0.18 --wait
+.build/release/macos-bg-cua cursor click --wait
 .build/release/macos-bg-cua cursor status
 .build/release/macos-bg-cua cursor stop
 ```

@@ -149,14 +149,14 @@ file under `/tmp/macos-bg-cua-cursor`.
 Commands:
 
 ```bash
-.build/release/macos-bg-cua cursor start background <wid> <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor start foreground-app <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor start foreground-desktop <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor move <x> <y> [--coord pixel|normalized|global] [--duration 0.18]
-.build/release/macos-bg-cua cursor retarget background <wid> [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor retarget foreground-app [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor retarget foreground-desktop [--coord pixel|normalized|global] [--duration 0.0]
-.build/release/macos-bg-cua cursor click
+.build/release/macos-bg-cua cursor start background <wid> <x> <y> [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor start foreground-app <x> <y> [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor start foreground-desktop <x> <y> [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor move <x> <y> [--coord pixel|normalized|global] [--duration 0.18] [--wait]
+.build/release/macos-bg-cua cursor retarget background <wid> [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor retarget foreground-app [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor retarget foreground-desktop [--coord pixel|normalized|global] [--duration 0.0] [--wait]
+.build/release/macos-bg-cua cursor click [--wait]
 .build/release/macos-bg-cua cursor hide
 .build/release/macos-bg-cua cursor show
 .build/release/macos-bg-cua cursor status
@@ -166,6 +166,7 @@ Commands:
 Notes:
 
 - `cursor move` animates at 60 Hz with cubic easing.
+- `--wait` blocks the CLI until the requested cursor move or click feedback has finished.
 - `cursor start background ...` and `cursor retarget background ...` try to keep
   the cursor ordered above the target window and below other overlapping front
   windows by reordering relative to the target `wid`.
