@@ -430,6 +430,10 @@ struct CursorState: Codable, Equatable {
 let cursorSessionDirectory = "/tmp/macos-bg-cua-cursor"
 let cursorStatePath = "\(cursorSessionDirectory)/state.json"
 let cursorPIDPath = "\(cursorSessionDirectory)/pid"
+let cursorReadyPath = "\(cursorSessionDirectory)/ready"
+let cursorVisibilityAnimationDuration = 0.12
+let cursorClickPressDuration = 0.05
+let cursorClickPulseDuration = 0.22
 
 func ensureCursorSessionDirectory() throws {
     try FileManager.default.createDirectory(atPath: cursorSessionDirectory, withIntermediateDirectories: true)
@@ -458,6 +462,15 @@ func writeCursorPID(_ pid: Int32) throws {
     try atomicWrite(Data(String(pid).utf8), to: cursorPIDPath)
 }
 
+func writeCursorReady() throws {
+    try ensureCursorSessionDirectory()
+    try atomicWrite(Data("ready".utf8), to: cursorReadyPath)
+}
+
+func isCursorReady() -> Bool {
+    FileManager.default.fileExists(atPath: cursorReadyPath)
+}
+
 func readCursorPID() -> Int32? {
     guard let raw = try? String(contentsOfFile: cursorPIDPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
           let pid = Int32(raw) else {
@@ -474,6 +487,7 @@ func isProcessAlive(_ pid: Int32) -> Bool {
 func removeCursorSessionFiles() {
     try? FileManager.default.removeItem(atPath: cursorStatePath)
     try? FileManager.default.removeItem(atPath: cursorPIDPath)
+    try? FileManager.default.removeItem(atPath: cursorReadyPath)
 }
 
 func currentExecutablePath() -> String {
@@ -486,6 +500,7 @@ func spawnCursorDaemonIfNeeded() throws -> Int32 {
     if let pid = readCursorPID(), isProcessAlive(pid) {
         return pid
     }
+    try? FileManager.default.removeItem(atPath: cursorReadyPath)
     let process = Process()
     process.executableURL = URL(fileURLWithPath: currentExecutablePath())
     process.arguments = ["cursor-daemon"]
@@ -496,6 +511,10 @@ func spawnCursorDaemonIfNeeded() throws -> Int32 {
     try process.run()
     let pid = process.processIdentifier
     try writeCursorPID(pid)
+    for _ in 0..<40 {
+        if isCursorReady() { break }
+        usleep(25_000)
+    }
     return pid
 }
 
@@ -540,16 +559,29 @@ final class CursorView: NSView {
 
     override var isOpaque: Bool { false }
 
+    private func drawCursor(in rect: CGRect, tint: NSColor, tintAlpha: CGFloat, glowAlpha: CGFloat, imageAlpha: CGFloat) {
+        NSGraphicsContext.current?.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 6
+        shadow.shadowOffset = CGSize(width: 0, height: -1)
+        shadow.shadowColor = tint.withAlphaComponent(glowAlpha)
+        shadow.set()
+        Self.cursorImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: imageAlpha)
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        guard tintAlpha > 0 else { return }
+        NSGraphicsContext.current?.saveGraphicsState()
+        Self.cursorImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: imageAlpha)
+        NSGraphicsContext.current?.compositingOperation = .sourceAtop
+        tint.withAlphaComponent(tintAlpha).setFill()
+        NSBezierPath(rect: rect).fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill()
         dirtyRect.fill()
 
-        NSGraphicsContext.current?.saveGraphicsState()
-        let shadow = NSShadow()
-        shadow.shadowBlurRadius = 3
-        shadow.shadowOffset = CGSize(width: 0, height: -1)
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
-        shadow.set()
         let scale: CGFloat = pressed ? 0.94 : 1.0
         let imageSize = CGSize(width: Self.cursorImage.size.width * scale, height: Self.cursorImage.size.height * scale)
         let imageOrigin = CGPoint(
@@ -557,36 +589,21 @@ final class CursorView: NSView {
             y: Self.imageOrigin.y + (Self.cursorImage.size.height - imageSize.height) * 0.15
         )
         let rect = CGRect(origin: imageOrigin, size: imageSize)
-        Self.cursorImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: pressed ? 0.88 : 1.0)
-        NSGraphicsContext.current?.restoreGraphicsState()
-
-        guard clickPulseProgress >= 0, clickPulseProgress <= 1 else { return }
-        let eased = 1 - pow(1 - clickPulseProgress, 3)
-        let pulseCenter = CGPoint(x: Self.effectiveHotSpot.x + 1.0, y: Self.effectiveHotSpot.y - 1.0)
-        let radius = 4.0 + (18.0 * eased)
-        let alpha = 0.65 * (1 - clickPulseProgress)
-        let pulseRect = CGRect(x: pulseCenter.x - radius, y: pulseCenter.y - radius, width: radius * 2, height: radius * 2)
-        let pulse = NSBezierPath(ovalIn: pulseRect)
-        let pulseShadow = NSShadow()
-        pulseShadow.shadowBlurRadius = 3
-        pulseShadow.shadowOffset = .zero
-        pulseShadow.shadowColor = NSColor.black.withAlphaComponent(alpha * 0.35)
-
-        NSGraphicsContext.current?.saveGraphicsState()
-        pulseShadow.set()
-        NSColor.white.withAlphaComponent(alpha).setStroke()
-        pulse.lineWidth = 2.2 - (0.6 * clickPulseProgress)
-        pulse.stroke()
-        NSGraphicsContext.current?.restoreGraphicsState()
+        let accentProgress = clickPulseProgress >= 0 && clickPulseProgress <= 1 ? (1 - clickPulseProgress) : 0
+        let baseTint = pressed ? NSColor.systemOrange : NSColor.systemCyan
+        let tintAlpha = pressed ? 1.0 : (0.28 + 0.82 * accentProgress)
+        let glowAlpha = pressed ? 0.9 : (0.22 + 0.62 * accentProgress)
+        let imageAlpha: CGFloat = pressed ? 1.0 : 1.0
+        drawCursor(in: rect, tint: baseTint, tintAlpha: tintAlpha, glowAlpha: glowAlpha, imageAlpha: imageAlpha)
     }
 }
 
 final class CursorOverlayController: NSObject, NSApplicationDelegate {
     private let cursorSize = CursorView.canvasSize
     private let hotSpot = CursorView.effectiveHotSpot
-    private let visibilityAnimationDuration = 0.12
-    private let clickPressDuration = 0.05
-    private let clickPulseDuration = 0.2
+    private let visibilityAnimationDuration = cursorVisibilityAnimationDuration
+    private let clickPressDuration = cursorClickPressDuration
+    private let clickPulseDuration = cursorClickPulseDuration
     private var window: NSWindow!
     private var view: CursorView!
     private var timer: Timer?
@@ -620,6 +637,9 @@ final class CursorOverlayController: NSObject, NSApplicationDelegate {
         window.contentView = view
         window.orderOut(nil)
 
+        bootstrapFromState()
+        try? writeCursorReady()
+
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
@@ -650,6 +670,25 @@ final class CursorOverlayController: NSObject, NSApplicationDelegate {
     @objc private func handleStopNotification() {
         shouldTerminateAfterHide = true
         beginVisibilityAnimation(to: 0.0)
+    }
+
+    private func bootstrapFromState() {
+        guard let state = try? readCursorState() else { return }
+        lastState = state
+        if let (point, _) = try? mousePointForCursorState(state) {
+            currentPoint = point
+            animationStart = point
+            animationTarget = point
+            animationDuration = 0
+            let origin = CGPoint(x: point.x - hotSpot.x, y: point.y - hotSpot.y)
+            window.setFrameOrigin(origin)
+        }
+        let initialVisibility = state.visible ? 0.0 : 0.0
+        currentVisibility = initialVisibility
+        visibilityFrom = initialVisibility
+        visibilityTo = state.visible ? 1.0 : 0.0
+        visibilityStartTime = CACurrentMediaTime()
+        window.alphaValue = initialVisibility
     }
 
     private func beginVisibilityAnimation(to target: Double) {
@@ -1382,9 +1421,10 @@ func parsePressModifiers(cursor: inout ArgumentCursor) throws -> [String] {
     return modifiers
 }
 
-func parseCursorMoveOptions(cursor: inout ArgumentCursor, defaultDuration: Double = 0.18) throws -> (Double, CoordMode?) {
+func parseCursorMoveOptions(cursor: inout ArgumentCursor, defaultDuration: Double = 0.18) throws -> (Double, CoordMode?, Bool) {
     var duration = defaultDuration
     var coord: CoordMode?
+    var wait = false
     while !cursor.args.isEmpty {
         let arg = try cursor.pop()
         switch arg {
@@ -1394,11 +1434,27 @@ func parseCursorMoveOptions(cursor: inout ArgumentCursor, defaultDuration: Doubl
             let raw = try cursor.pop()
             guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
             coord = parsed
+        case "--wait":
+            wait = true
         default:
             throw CUAError.usage("unknown cursor option: \(arg)")
         }
     }
-    return (duration, coord)
+    return (duration, coord, wait)
+}
+
+func parseCursorClickOptions(cursor: inout ArgumentCursor) throws -> Bool {
+    var wait = false
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        switch arg {
+        case "--wait":
+            wait = true
+        default:
+            throw CUAError.usage("unknown cursor click option: \(arg)")
+        }
+    }
+    return wait
 }
 
 func printCursorStatus() throws {
@@ -1446,7 +1502,7 @@ func runCursorCommand(cursor: inout ArgumentCursor) throws {
 
         let x = Double(try cursor.popDouble())
         let y = Double(try cursor.popDouble())
-        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
+        let (duration, overrideCoord, wait) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
         let coord = overrideCoord ?? .pixel
         try writeCursorState(CursorState(
             mode: mode,
@@ -1459,17 +1515,23 @@ func runCursorCommand(cursor: inout ArgumentCursor) throws {
             updatedAt: Date().timeIntervalSince1970
         ))
         let pid = try spawnCursorDaemonIfNeeded()
+        if wait, duration > 0 {
+            usleep(useconds_t(duration * 1_000_000))
+        }
         try printJSON(["ok": true, "pid": Int(pid), "mode": mode.rawValue, "wid": (wid as Any?) ?? NSNull()])
     case "move":
         var state = try readCursorState()
         state.x = Double(try cursor.popDouble())
         state.y = Double(try cursor.popDouble())
-        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor)
+        let (duration, overrideCoord, wait) = try parseCursorMoveOptions(cursor: &cursor)
         state.duration = duration
         if let overrideCoord { state.coord = overrideCoord.rawValue }
         state.visible = true
         state.updatedAt = Date().timeIntervalSince1970
         try writeCursorState(state)
+        if wait, duration > 0 {
+            usleep(useconds_t(duration * 1_000_000))
+        }
         try printJSON(["ok": true])
     case "retarget":
         var state = try readCursorState()
@@ -1485,11 +1547,14 @@ func runCursorCommand(cursor: inout ArgumentCursor) throws {
         case .foregroundApp, .foregroundDesktop:
             state.wid = nil
         }
-        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
+        let (duration, overrideCoord, wait) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
         state.duration = duration
         if let overrideCoord { state.coord = overrideCoord.rawValue }
         state.updatedAt = Date().timeIntervalSince1970
         try writeCursorState(state)
+        if wait, duration > 0 {
+            usleep(useconds_t(duration * 1_000_000))
+        }
         try printJSON(["ok": true, "mode": state.mode.rawValue, "wid": (state.wid as Any?) ?? NSNull()])
     case "hide":
         var state = try readCursorState()
@@ -1504,7 +1569,11 @@ func runCursorCommand(cursor: inout ArgumentCursor) throws {
         try writeCursorState(state)
         try printJSON(["ok": true])
     case "click":
+        let wait = try parseCursorClickOptions(cursor: &cursor)
         notifyCursorClickPulse()
+        if wait {
+            usleep(useconds_t((cursorClickPressDuration + cursorClickPulseDuration) * 1_000_000))
+        }
         try printJSON(["ok": true])
     case "status":
         try printCursorStatus()
@@ -1516,6 +1585,18 @@ func runCursorCommand(cursor: inout ArgumentCursor) throws {
                 try? writeCursorState(state)
             }
             notifyCursorStop()
+            for _ in 0..<8 {
+                usleep(50_000)
+                if !isProcessAlive(pid) { break }
+            }
+            if isProcessAlive(pid) {
+                kill(pid, SIGTERM)
+                usleep(50_000)
+            }
+            if isProcessAlive(pid) {
+                kill(pid, SIGKILL)
+            }
+            removeCursorSessionFiles()
         } else {
             removeCursorSessionFiles()
         }
