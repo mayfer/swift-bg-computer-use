@@ -541,82 +541,66 @@ func mousePointForCursorState(_ state: CursorState) throws -> (CGPoint, CGWindow
 }
 
 final class CursorView: NSView {
-    static let cursorImage = NSCursor.arrow.image
-    static let cursorHotSpot = NSCursor.arrow.hotSpot
-    static let renderScale: CGFloat = 2.0
-    static let strokeWidth: CGFloat = 3.0
-    static let canvasPadding: CGFloat = 28
-    static let scaledCursorSize = CGSize(
-        width: cursorImage.size.width * renderScale,
-        height: cursorImage.size.height * renderScale
-    )
+    static let canvasPadding: CGFloat = 24
+    static let pointerBounds = CGRect(x: 0, y: -45, width: 26, height: 45)
     static let canvasSize = CGSize(
-        width: scaledCursorSize.width + (canvasPadding * 2),
-        height: scaledCursorSize.height + (canvasPadding * 2)
+        width: pointerBounds.width + (canvasPadding * 2),
+        height: pointerBounds.height + (canvasPadding * 2)
     )
-    static let imageOrigin = CGPoint(x: canvasPadding, y: canvasPadding)
     static let effectiveHotSpot = CGPoint(
-        x: imageOrigin.x + cursorHotSpot.x * renderScale,
-        y: imageOrigin.y + cursorHotSpot.y * renderScale
+        x: canvasPadding - pointerBounds.minX,
+        y: canvasPadding - pointerBounds.minY
     )
-    static let fillColor = NSColor(calibratedRed: 0.80, green: 0.98, blue: 0.72, alpha: 1.0)
-    static let pressedFillColor = NSColor(calibratedRed: 0.96, green: 1.0, blue: 0.90, alpha: 1.0)
-
-    static func scaledImageHotSpot(scale: CGFloat) -> CGPoint {
-        CGPoint(
-            x: cursorHotSpot.x * renderScale * scale,
-            y: (cursorImage.size.height - cursorHotSpot.y) * renderScale * scale
-        )
-    }
+    static let fillColor = NSColor(calibratedWhite: 0.06, alpha: 1.0)
+    static let pressedFillColor = NSColor(calibratedWhite: 0.14, alpha: 1.0)
+    static let glowColor = NSColor(calibratedRed: 0.75, green: 0.97, blue: 0.70, alpha: 0.9)
+    static let borderWidth: CGFloat = 3.0
 
     var pressed = false { didSet { needsDisplay = true } }
     var clickPulseProgress: CGFloat = -1 { didSet { needsDisplay = true } }
 
     override var isOpaque: Bool { false }
 
-    private func drawTintedCursorImage(in rect: CGRect, color: NSColor, alpha: CGFloat) {
-        NSGraphicsContext.current?.saveGraphicsState()
-        Self.cursorImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: alpha)
-        NSGraphicsContext.current?.compositingOperation = .sourceAtop
-        color.withAlphaComponent(alpha).setFill()
-        NSBezierPath(rect: rect).fill()
-        NSGraphicsContext.current?.restoreGraphicsState()
-    }
-
-    private func drawOutlinedCursorImage(in rect: CGRect, alpha: CGFloat) {
-        let outlineInset = Self.strokeWidth * CGFloat(0.5)
-        let outlineRect = rect.insetBy(dx: CGFloat.zero - outlineInset, dy: CGFloat.zero - outlineInset)
-        for offset in [
-            CGPoint(x: -Self.strokeWidth, y: 0),
-            CGPoint(x: Self.strokeWidth, y: 0),
-            CGPoint(x: 0, y: -Self.strokeWidth),
-            CGPoint(x: 0, y: Self.strokeWidth),
-            CGPoint(x: -Self.strokeWidth * 0.7, y: -Self.strokeWidth * 0.7),
-            CGPoint(x: Self.strokeWidth * 0.7, y: -Self.strokeWidth * 0.7),
-            CGPoint(x: -Self.strokeWidth * 0.7, y: Self.strokeWidth * 0.7),
-            CGPoint(x: Self.strokeWidth * 0.7, y: Self.strokeWidth * 0.7)
-        ] {
-            let shifted = outlineRect.offsetBy(dx: offset.x, dy: offset.y)
-            drawTintedCursorImage(in: shifted, color: .black, alpha: alpha)
+    private func cursorPath(scale: CGFloat, points: [CGPoint]) -> NSBezierPath {
+        let anchor = Self.effectiveHotSpot
+        let path = NSBezierPath()
+        for (index, point) in points.enumerated() {
+            let scaled = CGPoint(x: anchor.x + point.x * scale, y: anchor.y + point.y * scale)
+            if index == 0 {
+                path.move(to: scaled)
+            } else {
+                path.line(to: scaled)
+            }
         }
+        path.close()
+        path.lineJoinStyle = .round
+        path.lineCapStyle = .round
+        return path
     }
 
-    private func drawCursor(in rect: CGRect, tint: NSColor, tintAlpha: CGFloat, glowAlpha: CGFloat, imageAlpha: CGFloat) {
+    private func drawCursor(scale: CGFloat, fill: NSColor) {
+        let points: [CGPoint] = [
+            CGPoint(x: 0, y: 0),
+            CGPoint(x: 0, y: -34),
+            CGPoint(x: 8, y: -27),
+            CGPoint(x: 13, y: -45),
+            CGPoint(x: 19, y: -43),
+            CGPoint(x: 14, y: -26),
+            CGPoint(x: 26, y: -26)
+        ]
+        let path = cursorPath(scale: scale, points: points)
         NSGraphicsContext.current?.saveGraphicsState()
         let shadow = NSShadow()
-        shadow.shadowBlurRadius = 6
+        shadow.shadowBlurRadius = 10
         shadow.shadowOffset = CGSize(width: 0, height: -2)
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.42 + glowAlpha * 0.12)
+        shadow.shadowColor = Self.glowColor
         shadow.set()
-        drawOutlinedCursorImage(in: rect, alpha: imageAlpha)
-        drawTintedCursorImage(in: rect, color: tint, alpha: imageAlpha)
+        fill.setFill()
+        NSColor.white.setStroke()
+        path.lineWidth = Self.borderWidth
+        path.fill()
+        path.stroke()
         NSGraphicsContext.current?.restoreGraphicsState()
-
-        if tintAlpha > 0 {
-            NSGraphicsContext.current?.saveGraphicsState()
-            drawTintedCursorImage(in: rect, color: tint, alpha: tintAlpha)
-            NSGraphicsContext.current?.restoreGraphicsState()
-        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -624,21 +608,10 @@ final class CursorView: NSView {
         dirtyRect.fill()
 
         let scale: CGFloat = pressed ? 0.94 : 1.0
-        let imageSize = CGSize(width: Self.scaledCursorSize.width * scale, height: Self.scaledCursorSize.height * scale)
-        let scaledHotSpot = Self.scaledImageHotSpot(scale: scale)
-        let imageOrigin = CGPoint(
-            x: Self.effectiveHotSpot.x - scaledHotSpot.x,
-            y: Self.effectiveHotSpot.y - scaledHotSpot.y
-        )
-        let rect = CGRect(origin: imageOrigin, size: imageSize)
-        let accentProgress = clickPulseProgress >= 0 && clickPulseProgress <= 1 ? (1 - clickPulseProgress) : 0
-        let baseTint = pressed ? Self.pressedFillColor : Self.fillColor
-        let tintAlpha = pressed ? 1.0 : (0.18 + 0.28 * accentProgress)
-        let glowAlpha = pressed ? 0.88 : (0.18 + 0.24 * accentProgress)
-        let imageAlpha: CGFloat = pressed ? 1.0 : 1.0
+        let fill = pressed ? Self.pressedFillColor : Self.fillColor
 
         if pressed {
-            let pulseCenter = CGPoint(x: Self.effectiveHotSpot.x, y: Self.effectiveHotSpot.y)
+            let pulseCenter = Self.effectiveHotSpot
             let ringRadius: CGFloat = 18
             let ringRect = CGRect(x: pulseCenter.x - ringRadius, y: pulseCenter.y - ringRadius, width: ringRadius * 2, height: ringRadius * 2)
             let ring = NSBezierPath(ovalIn: ringRect)
@@ -646,7 +619,7 @@ final class CursorView: NSView {
             let ringShadow = NSShadow()
             ringShadow.shadowBlurRadius = 6
             ringShadow.shadowOffset = CGSize(width: 0, height: -2)
-            ringShadow.shadowColor = NSColor.black.withAlphaComponent(0.38)
+            ringShadow.shadowColor = Self.glowColor.withAlphaComponent(0.7)
             ringShadow.set()
             NSColor.white.setStroke()
             ring.lineWidth = 2
@@ -654,7 +627,7 @@ final class CursorView: NSView {
             NSGraphicsContext.current?.restoreGraphicsState()
         }
 
-        drawCursor(in: rect, tint: baseTint, tintAlpha: tintAlpha, glowAlpha: glowAlpha, imageAlpha: imageAlpha)
+        drawCursor(scale: scale, fill: fill)
     }
 }
 
