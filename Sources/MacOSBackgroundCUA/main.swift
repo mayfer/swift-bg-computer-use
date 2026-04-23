@@ -223,6 +223,158 @@ func isSettable(_ element: AXUIElement?, _ attribute: CFString) -> Bool {
     return AXUIElementIsAttributeSettable(element, attribute, &settable) == .success && settable.boolValue
 }
 
+func axAttributeNames(_ element: AXUIElement?) -> [String] {
+    guard let element else { return [] }
+    var names: CFArray?
+    guard AXUIElementCopyAttributeNames(element, &names) == .success,
+          let names = names as? [String] else {
+        return []
+    }
+    return names
+}
+
+func axParameterizedAttributeNames(_ element: AXUIElement?) -> [String] {
+    guard let element else { return [] }
+    var names: CFArray?
+    guard AXUIElementCopyParameterizedAttributeNames(element, &names) == .success,
+          let names = names as? [String] else {
+        return []
+    }
+    return names
+}
+
+func axDebugValue(_ value: Any?) -> Any? {
+    guard let value else { return nil }
+    if let string = value as? String { return string }
+    if let number = value as? NSNumber { return number }
+    if let array = value as? [Any] { return array.prefix(12).compactMap(axDebugValue) }
+    if CFGetTypeID(value as CFTypeRef) == AXUIElementGetTypeID() {
+        return compactAXInfo((value as! AXUIElement))
+    }
+    if CFGetTypeID(value as CFTypeRef) == AXValueGetTypeID() {
+        let axValue = value as! AXValue
+        switch AXValueGetType(axValue) {
+        case .cgPoint:
+            var point = CGPoint.zero
+            AXValueGetValue(axValue, .cgPoint, &point)
+            return ["x": point.x, "y": point.y]
+        case .cgSize:
+            var size = CGSize.zero
+            AXValueGetValue(axValue, .cgSize, &size)
+            return ["width": size.width, "height": size.height]
+        case .cgRect:
+            var rect = CGRect.zero
+            AXValueGetValue(axValue, .cgRect, &rect)
+            return ["x": rect.origin.x, "y": rect.origin.y, "width": rect.width, "height": rect.height]
+        case .cfRange:
+            var range = CFRange()
+            AXValueGetValue(axValue, .cfRange, &range)
+            return ["location": range.location, "length": range.length]
+        case .axError, .illegal:
+            return String(describing: value)
+        @unknown default:
+            return String(describing: value)
+        }
+    }
+    return String(describing: value)
+}
+
+func compactAXInfo(_ element: AXUIElement?) -> [String: Any] {
+    guard let element else { return [:] }
+    let interestingAttributes: [CFString] = [
+        kAXRoleAttribute as CFString,
+        kAXSubroleAttribute as CFString,
+        kAXTitleAttribute as CFString,
+        kAXValueAttribute as CFString,
+        kAXSelectedTextAttribute as CFString,
+        kAXSelectedTextRangeAttribute as CFString,
+        kAXDescriptionAttribute as CFString,
+        "AXPlaceholderValue" as CFString,
+        "AXDOMIdentifier" as CFString,
+        kAXFocusedAttribute as CFString,
+        kAXEnabledAttribute as CFString,
+        kAXSelectedAttribute as CFString
+    ]
+    var object: [String: Any] = [:]
+    for attribute in interestingAttributes {
+        if let value = axDebugValue(axGet(element, attribute)) {
+            object[attribute as String] = value
+        }
+    }
+    if let bounds = axBounds(element) {
+        object["bounds"] = ["x": bounds.origin.x, "y": bounds.origin.y, "width": bounds.width, "height": bounds.height]
+    }
+    object["actions"] = axActions(element)
+    object["settable"] = axAttributeNames(element).filter { isSettable(element, $0 as CFString) }
+    object["parameterized"] = axParameterizedAttributeNames(element)
+    return object
+}
+
+func axAncestorChain(_ element: AXUIElement?, maxDepth: Int = 8) -> [[String: Any]] {
+    var result: [[String: Any]] = []
+    var current = element
+    for _ in 0..<maxDepth {
+        guard let candidate = current else { break }
+        result.append(compactAXInfo(candidate))
+        current = axParent(candidate)
+    }
+    return result
+}
+
+func axChildrenSummary(_ element: AXUIElement?, maxDepth: Int = 3, maxItems: Int = 80) -> [[String: Any]] {
+    guard let element else { return [] }
+    var result: [[String: Any]] = []
+    var queue: [(AXUIElement, Int)] = [(element, 0)]
+    while !queue.isEmpty, result.count < maxItems {
+        let (current, depth) = queue.removeFirst()
+        if depth > 0 {
+            var info = compactAXInfo(current)
+            info["depth"] = depth
+            result.append(info)
+        }
+        if depth >= maxDepth { continue }
+        let children = axGet(current, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
+        for child in children {
+            queue.append((child, depth + 1))
+        }
+    }
+    return result
+}
+
+func axDump(wid: CGWindowID, x: CGFloat, y: CGFloat, coord: CoordMode) throws -> [String: Any] {
+    let (_, app, bounds) = try attach(wid)
+    let point = toGlobal(bounds: bounds, x: x, y: y, coord: coord)
+    let hit = hitTest(app: app, x: point.x, y: point.y)
+    let (plan, target, role) = planClick(hit, point: point)
+    let focused = axGet(app, kAXFocusedUIElementAttribute as CFString) as! AXUIElement?
+    return [
+        "window": Int(wid),
+        "point": ["x": point.x, "y": point.y],
+        "hit": compactAXInfo(hit),
+        "plan": ["name": plan.rawValue, "role": role],
+        "target": compactAXInfo(target),
+        "targetAncestors": axAncestorChain(target),
+        "focused": compactAXInfo(focused),
+        "focusedAncestors": axAncestorChain(focused),
+        "appChildren": axChildrenSummary(app, maxDepth: 2, maxItems: 80)
+    ]
+}
+
+func axAction(wid: CGWindowID, x: CGFloat, y: CGFloat, action: String, coord: CoordMode) throws -> [String: Any] {
+    let (_, app, bounds) = try attach(wid)
+    let point = toGlobal(bounds: bounds, x: x, y: y, coord: coord)
+    let hit = hitTest(app: app, x: point.x, y: point.y)
+    let (plan, target, role) = planClick(hit, point: point)
+    let ok = target.map { AXUIElementPerformAction($0, action as CFString) == .success } ?? false
+    return [
+        "ok": ok,
+        "action": action,
+        "plan": plan.rawValue,
+        "role": role,
+        "target": compactAXInfo(target)
+    ]
+}
+
 func hitTest(app: AXUIElement, x: CGFloat, y: CGFloat) -> AXUIElement? {
     var element: AXUIElement?
     let error = AXUIElementCopyElementAtPosition(app, Float(x), Float(y), &element)
@@ -976,6 +1128,115 @@ func cgKey(pid: pid_t, keycode: CGKeyCode, down: Bool, flags: CGEventFlags = [])
     event.postToPid(pid)
 }
 
+func cgKeyPress(pid: pid_t, keycode: CGKeyCode, flags: CGEventFlags = [], hold: useconds_t = 35_000) {
+    cgKey(pid: pid, keycode: keycode, down: true, flags: flags)
+    usleep(hold)
+    cgKey(pid: pid, keycode: keycode, down: false, flags: flags)
+}
+
+func nsModifierFlags(_ modifiers: [String]) -> NSEvent.ModifierFlags {
+    modifiers.reduce(NSEvent.ModifierFlags()) { partial, modifier in
+        var result = partial
+        switch modifier.lowercased() {
+        case "shift":
+            result.insert(.shift)
+        case "cmd", "command":
+            result.insert(.command)
+        case "alt", "option", "opt":
+            result.insert(.option)
+        case "ctrl", "control":
+            result.insert(.control)
+        case "fn":
+            result.insert(.function)
+        default:
+            break
+        }
+        return result
+    }
+}
+
+func charactersForKey(_ key: String, modifiers: [String]) -> (String, String)? {
+    switch key {
+    case "Enter", "Return", "KP_Enter":
+        return ("\r", "\r")
+    case "Tab":
+        return ("\t", "\t")
+    case "Space", " ":
+        return (" ", " ")
+    case "Backspace", "Delete":
+        return ("\u{8}", "\u{8}")
+    case "Escape", "Esc":
+        return ("\u{1b}", "\u{1b}")
+    default:
+        break
+    }
+
+    guard key.count == 1, let character = key.first else { return nil }
+    let shift = modifiers.contains { $0.lowercased() == "shift" }
+    if shift, let base = shifted[character] {
+        return (String(character), base)
+    }
+    if shift {
+        return (String(character).uppercased(), String(character).lowercased())
+    }
+    return (String(character), String(character).lowercased())
+}
+
+func nsKeyPress(pid: pid_t, wid: CGWindowID, keycode: CGKeyCode, key: String, modifiers: [String], hold: useconds_t = 35_000) -> Bool {
+    guard let (characters, charactersIgnoringModifiers) = charactersForKey(key, modifiers: modifiers) else {
+        return false
+    }
+    let flags = nsModifierFlags(modifiers)
+    let timestamp = ProcessInfo.processInfo.systemUptime
+    guard let down = NSEvent.keyEvent(
+        with: .keyDown,
+        location: .zero,
+        modifierFlags: flags,
+        timestamp: timestamp,
+        windowNumber: Int(wid),
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: charactersIgnoringModifiers,
+        isARepeat: false,
+        keyCode: UInt16(keycode)
+    )?.cgEvent else {
+        return false
+    }
+    guard let up = NSEvent.keyEvent(
+        with: .keyUp,
+        location: .zero,
+        modifierFlags: flags,
+        timestamp: timestamp + Double(hold) / 1_000_000,
+        windowNumber: Int(wid),
+        context: nil,
+        characters: characters,
+        charactersIgnoringModifiers: charactersIgnoringModifiers,
+        isARepeat: false,
+        keyCode: UInt16(keycode)
+    )?.cgEvent else {
+        return false
+    }
+    down.postToPid(pid)
+    usleep(hold)
+    up.postToPid(pid)
+    return true
+}
+
+func nsTypeText(pid: pid_t, wid: CGWindowID, text: String) -> Bool {
+    var didType = false
+    for character in text {
+        guard let (code, needsShift) = keycodeForCharacter(character) else { return false }
+        let modifiers = needsShift ? ["shift"] : []
+        if nsKeyPress(pid: pid, wid: wid, keycode: code, key: String(character), modifiers: modifiers) {
+            didType = true
+        } else {
+            return false
+        }
+        usleep(20_000)
+    }
+    return didType || text.isEmpty
+}
+
 func globalKey(keycode: CGKeyCode, down: Bool, flags: CGEventFlags = []) {
     guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keycode, keyDown: down) else { return }
     event.flags = flags
@@ -1199,10 +1460,36 @@ func typeText(wid: CGWindowID, text: String, at: (CGFloat, CGFloat)?, coord: Coo
         target = focused
     }
     if let target {
-        if replace, axSet(target, kAXValueAttribute as CFString, text) {
-            return "ax"
+        if replace {
+            let before = axGet(target, kAXValueAttribute as CFString) as? String ?? ""
+            var fullRange = CFRange(location: 0, length: before.count)
+            if let rangeValue = AXValueCreate(.cfRange, &fullRange),
+               axSet(target, kAXSelectedTextRangeAttribute as CFString, rangeValue),
+               nsTypeText(pid: pid, wid: wid, text: text) {
+                usleep(120_000)
+                if (axGet(target, kAXValueAttribute as CFString) as? String ?? "") == text {
+                    return "nsevent-selected"
+                }
+            }
+            let current = axGet(target, kAXValueAttribute as CFString) as? String ?? ""
+            var currentRange = CFRange(location: 0, length: current.count)
+            if let rangeValue = AXValueCreate(.cfRange, &currentRange),
+               axSet(target, kAXSelectedTextRangeAttribute as CFString, rangeValue),
+               axSet(target, kAXSelectedTextAttribute as CFString, text),
+               (axGet(target, kAXValueAttribute as CFString) as? String ?? "") == text {
+                return "ax-selected"
+            }
+            if axSet(target, kAXValueAttribute as CFString, text) {
+                return "ax"
+            }
         }
         let before = axGet(target, kAXValueAttribute as CFString) as? String ?? ""
+        if nsTypeText(pid: pid, wid: wid, text: text) {
+            usleep(120_000)
+            if (axGet(target, kAXValueAttribute as CFString) as? String ?? "") == before + text {
+                return "nsevent"
+            }
+        }
         if axSet(target, kAXSelectedTextAttribute as CFString, text),
            (axGet(target, kAXValueAttribute as CFString) as? String ?? "") != before {
             return "ax"
@@ -1214,8 +1501,7 @@ func typeText(wid: CGWindowID, text: String, at: (CGFloat, CGFloat)?, coord: Coo
     for character in text {
         guard let (code, needsShift) = keycodeForCharacter(character) else { continue }
         let flags: CGEventFlags = needsShift ? .maskShift : []
-        cgKey(pid: pid, keycode: code, down: true, flags: flags)
-        cgKey(pid: pid, keycode: code, down: false, flags: flags)
+        cgKeyPress(pid: pid, keycode: code, flags: flags)
     }
     return "cg"
 }
@@ -1260,9 +1546,11 @@ func pressKey(wid: CGWindowID, key: String, modifiers: [String]) throws -> [Stri
     }
     guard let code else { throw CUAError.unknownKey(key) }
     let flags = flagsFor(mods)
-    cgKey(pid: pid, keycode: code, down: true, flags: flags)
-    cgKey(pid: pid, keycode: code, down: false, flags: flags)
-    return ["ok": true]
+    if nsKeyPress(pid: pid, wid: wid, keycode: code, key: key, modifiers: mods) {
+        return ["ok": true, "via": "nsevent-cg"]
+    }
+    cgKeyPress(pid: pid, keycode: code, flags: flags)
+    return ["ok": true, "via": "cg"]
 }
 
 func clickGlobal(x: CGFloat, y: CGFloat, coord: CoordMode, hold: useconds_t = 50_000) -> [String: Any] {
@@ -1692,6 +1980,19 @@ func runBackgroundSubcommand(cursor: inout ArgumentCursor) throws {
         let text = try cursor.pop()
         let (at, replace, coord) = try parseTypeOptions(cursor: &cursor)
         try printJSON(["via": typeText(wid: wid, text: text, at: at, coord: coord, replace: replace)])
+    case "ax-dump":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(axDump(wid: wid, x: x, y: y, coord: coord))
+    case "ax-action":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let action = try cursor.pop()
+        let coord = try cursor.parseCoord()
+        try printJSON(axAction(wid: wid, x: x, y: y, action: action, coord: coord))
     case "press":
         let wid = try cursor.popWindowID()
         let key = try cursor.pop()
