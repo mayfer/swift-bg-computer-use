@@ -6,6 +6,9 @@
 - `foreground-app`: target the frontmost app window
 - `foreground-desktop`: target the main display
 
+It also has a persistent `cursor` overlay helper for rendering a virtual cursor
+as a separate transparent window.
+
 The core design rule is simple: screenshots define the coordinate frame for the
 actions that follow.
 
@@ -136,6 +139,38 @@ Frontmost-window discovery:
 
 `active-window` and `foreground-app info` return the current frontmost app
 window. `foreground-desktop info` returns the main display bounds.
+
+## Virtual Cursor
+
+The `cursor` command starts a long-lived overlay helper. That helper draws a
+virtual cursor in a tiny transparent window and updates it from a shared state
+file under `/tmp/macos-bg-cua-cursor`.
+
+Commands:
+
+```bash
+.build/release/macos-bg-cua cursor start background <wid> <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor start foreground-app <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor start foreground-desktop <x> <y> [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor move <x> <y> [--coord pixel|normalized|global] [--duration 0.18]
+.build/release/macos-bg-cua cursor retarget background <wid> [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor retarget foreground-app [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor retarget foreground-desktop [--coord pixel|normalized|global] [--duration 0.0]
+.build/release/macos-bg-cua cursor click
+.build/release/macos-bg-cua cursor hide
+.build/release/macos-bg-cua cursor show
+.build/release/macos-bg-cua cursor status
+.build/release/macos-bg-cua cursor stop
+```
+
+Notes:
+
+- `cursor move` animates at 60 Hz with cubic easing.
+- `cursor start background ...` and `cursor retarget background ...` try to keep
+  the cursor ordered above the target window and below other overlapping front
+  windows by reordering relative to the target `wid`.
+- `cursor click` is visual only. It pulses the overlay but does not send a real
+  click event.
 
 ## Agent Loop
 

@@ -13,6 +13,9 @@ The tool has three operating modes:
 - `foreground-app`: target the frontmost app window
 - `foreground-desktop`: target the main display
 
+It also has a persistent `cursor` helper for rendering a virtual cursor overlay
+as a separate transparent window.
+
 All screenshots are meant to be used as the coordinate frame for later actions.
 For window screenshots, coordinates are relative to the cropped window image, not
 to a padded or shadowed frame.
@@ -53,6 +56,15 @@ For the main display:
 
 ```bash
 .build/release/macos-bg-cua foreground-desktop info
+```
+
+Virtual cursor:
+
+```bash
+.build/release/macos-bg-cua cursor start background <wid> <x> <y>
+.build/release/macos-bg-cua cursor move <x> <y> --duration 0.18
+.build/release/macos-bg-cua cursor status
+.build/release/macos-bg-cua cursor stop
 ```
 
 ## Agent Loop

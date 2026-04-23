@@ -3,6 +3,7 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 import ImageIO
+import QuartzCore
 import UniformTypeIdentifiers
 
 enum CUAError: Error, CustomStringConvertible {
@@ -11,6 +12,7 @@ enum CUAError: Error, CustomStringConvertible {
     case screenshotFailed(CGWindowID)
     case imageWriteFailed(String)
     case unknownKey(String)
+    case cursorStateUnavailable(String)
 
     var description: String {
         switch self {
@@ -19,6 +21,7 @@ enum CUAError: Error, CustomStringConvertible {
         case .screenshotFailed(let id): return "failed to capture window \(id)"
         case .imageWriteFailed(let path): return "failed to write image to \(path)"
         case .unknownKey(let key): return "unknown key: \(key)"
+        case .cursorStateUnavailable(let detail): return detail
         }
     }
 }
@@ -195,6 +198,21 @@ func axParent(_ element: AXUIElement?) -> AXUIElement? {
     axGet(element, kAXParentAttribute as CFString) as! AXUIElement?
 }
 
+func axBounds(_ element: AXUIElement?) -> CGRect? {
+    guard let element,
+          let positionValue = axGet(element, kAXPositionAttribute as CFString) as! AXValue?,
+          let sizeValue = axGet(element, kAXSizeAttribute as CFString) as! AXValue? else {
+        return nil
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue, .cgSize, &size) else {
+        return nil
+    }
+    return CGRect(origin: position, size: size)
+}
+
 func axRole(_ element: AXUIElement?) -> String {
     axGet(element, kAXRoleAttribute as CFString) as? String ?? ""
 }
@@ -260,7 +278,33 @@ func searchDescendants(_ element: AXUIElement?, maxDepth: Int = 3) -> (ClickPlan
     return nil
 }
 
-func planClick(_ element: AXUIElement?) -> (ClickPlan, AXUIElement?, String) {
+func searchDescendantsContainingPoint(_ element: AXUIElement?, point: CGPoint, maxDepth: Int = 6) -> (ClickPlan, AXUIElement, String)? {
+    guard let element else { return nil }
+
+    func visit(_ current: AXUIElement, depth: Int) -> (ClickPlan, AXUIElement, String)? {
+        guard depth <= maxDepth else { return nil }
+
+        let children = axGet(current, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
+        for child in children.reversed() {
+            if let bounds = axBounds(child), bounds.contains(point),
+               let hit = visit(child, depth: depth + 1) {
+                return hit
+            }
+        }
+
+        let (plan, role) = classify(current)
+        if let plan,
+           let bounds = axBounds(current),
+           bounds.contains(point) {
+            return (plan, current, role)
+        }
+        return nil
+    }
+
+    return visit(element, depth: 0)
+}
+
+func planClick(_ element: AXUIElement?, point: CGPoint? = nil) -> (ClickPlan, AXUIElement?, String) {
     guard let element else { return (.cg, nil, "") }
     let (directPlan, directRole) = classify(element)
     if let directPlan { return (directPlan, element, directRole) }
@@ -271,6 +315,10 @@ func planClick(_ element: AXUIElement?) -> (ClickPlan, AXUIElement?, String) {
         guard let candidate = current else { break }
         let (plan, role) = classify(candidate)
         if let plan { return (plan, candidate, role) }
+        if let point,
+           let hit = searchDescendantsContainingPoint(candidate, point: point) {
+            return hit
+        }
         current = axParent(candidate)
     }
 
@@ -360,6 +408,367 @@ enum ModeCommand: String {
     case type
     case press
     case hotkey
+}
+
+enum CursorTargetMode: String, Codable {
+    case background
+    case foregroundApp = "foreground-app"
+    case foregroundDesktop = "foreground-desktop"
+}
+
+struct CursorState: Codable, Equatable {
+    var mode: CursorTargetMode
+    var wid: Int?
+    var x: Double
+    var y: Double
+    var coord: String
+    var duration: Double
+    var visible: Bool
+    var updatedAt: Double
+}
+
+let cursorSessionDirectory = "/tmp/macos-bg-cua-cursor"
+let cursorStatePath = "\(cursorSessionDirectory)/state.json"
+let cursorPIDPath = "\(cursorSessionDirectory)/pid"
+
+func ensureCursorSessionDirectory() throws {
+    try FileManager.default.createDirectory(atPath: cursorSessionDirectory, withIntermediateDirectories: true)
+}
+
+func atomicWrite(_ data: Data, to path: String) throws {
+    let temp = "\(path).tmp.\(UUID().uuidString)"
+    try data.write(to: URL(fileURLWithPath: temp))
+    _ = try? FileManager.default.removeItem(atPath: path)
+    try FileManager.default.moveItem(atPath: temp, toPath: path)
+}
+
+func writeCursorState(_ state: CursorState) throws {
+    try ensureCursorSessionDirectory()
+    let data = try JSONEncoder().encode(state)
+    try atomicWrite(data, to: cursorStatePath)
+}
+
+func readCursorState() throws -> CursorState {
+    let data = try Data(contentsOf: URL(fileURLWithPath: cursorStatePath))
+    return try JSONDecoder().decode(CursorState.self, from: data)
+}
+
+func writeCursorPID(_ pid: Int32) throws {
+    try ensureCursorSessionDirectory()
+    try atomicWrite(Data(String(pid).utf8), to: cursorPIDPath)
+}
+
+func readCursorPID() -> Int32? {
+    guard let raw = try? String(contentsOfFile: cursorPIDPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+          let pid = Int32(raw) else {
+        return nil
+    }
+    return pid
+}
+
+func isProcessAlive(_ pid: Int32) -> Bool {
+    guard pid > 0 else { return false }
+    return kill(pid, 0) == 0
+}
+
+func removeCursorSessionFiles() {
+    try? FileManager.default.removeItem(atPath: cursorStatePath)
+    try? FileManager.default.removeItem(atPath: cursorPIDPath)
+}
+
+func currentExecutablePath() -> String {
+    let path = CommandLine.arguments[0]
+    if path.hasPrefix("/") { return path }
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(path).path
+}
+
+func spawnCursorDaemonIfNeeded() throws -> Int32 {
+    if let pid = readCursorPID(), isProcessAlive(pid) {
+        return pid
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: currentExecutablePath())
+    process.arguments = ["cursor-daemon"]
+    let null = FileHandle(forWritingAtPath: "/dev/null")
+    process.standardOutput = null
+    process.standardError = null
+    process.standardInput = nil
+    try process.run()
+    let pid = process.processIdentifier
+    try writeCursorPID(pid)
+    return pid
+}
+
+func mousePointForCursorState(_ state: CursorState) throws -> (CGPoint, CGWindowID?) {
+    guard let coord = CoordMode(rawValue: state.coord) else {
+        throw CUAError.cursorStateUnavailable("invalid cursor coord mode: \(state.coord)")
+    }
+    switch state.mode {
+    case .background:
+        guard let rawWid = state.wid else {
+            throw CUAError.cursorStateUnavailable("background cursor state is missing wid")
+        }
+        let window = try getWindow(CGWindowID(rawWid))
+        let quartzPoint = toGlobal(bounds: window.bounds, x: state.x, y: state.y, coord: coord)
+        return (quartzToAppKitPoint(quartzPoint), window.wid)
+    case .foregroundApp:
+        let window = try frontmostWindow()
+        let quartzPoint = toGlobal(bounds: window.bounds, x: state.x, y: state.y, coord: coord)
+        return (quartzToAppKitPoint(quartzPoint), window.wid)
+    case .foregroundDesktop:
+        let quartzPoint = displayPoint(x: state.x, y: state.y, coord: coord)
+        return (quartzToAppKitPoint(quartzPoint), nil)
+    }
+}
+
+final class CursorView: NSView {
+    static let cursorImage = NSCursor.arrow.image
+    static let cursorHotSpot = NSCursor.arrow.hotSpot
+    static let canvasPadding: CGFloat = 20
+    static let canvasSize = CGSize(
+        width: cursorImage.size.width + (canvasPadding * 2),
+        height: cursorImage.size.height + (canvasPadding * 2)
+    )
+    static let imageOrigin = CGPoint(x: canvasPadding, y: canvasPadding)
+    static let effectiveHotSpot = CGPoint(
+        x: imageOrigin.x + cursorHotSpot.x,
+        y: imageOrigin.y + cursorHotSpot.y
+    )
+
+    var pressed = false { didSet { needsDisplay = true } }
+    var clickPulseProgress: CGFloat = -1 { didSet { needsDisplay = true } }
+
+    override var isOpaque: Bool { false }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill()
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 3
+        shadow.shadowOffset = CGSize(width: 0, height: -1)
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.set()
+        let scale: CGFloat = pressed ? 0.94 : 1.0
+        let imageSize = CGSize(width: Self.cursorImage.size.width * scale, height: Self.cursorImage.size.height * scale)
+        let imageOrigin = CGPoint(
+            x: Self.imageOrigin.x + (Self.cursorImage.size.width - imageSize.width) * 0.35,
+            y: Self.imageOrigin.y + (Self.cursorImage.size.height - imageSize.height) * 0.15
+        )
+        let rect = CGRect(origin: imageOrigin, size: imageSize)
+        Self.cursorImage.draw(in: rect, from: .zero, operation: .sourceOver, fraction: pressed ? 0.88 : 1.0)
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        guard clickPulseProgress >= 0, clickPulseProgress <= 1 else { return }
+        let eased = 1 - pow(1 - clickPulseProgress, 3)
+        let pulseCenter = CGPoint(x: Self.effectiveHotSpot.x + 1.0, y: Self.effectiveHotSpot.y - 1.0)
+        let radius = 4.0 + (18.0 * eased)
+        let alpha = 0.65 * (1 - clickPulseProgress)
+        let pulseRect = CGRect(x: pulseCenter.x - radius, y: pulseCenter.y - radius, width: radius * 2, height: radius * 2)
+        let pulse = NSBezierPath(ovalIn: pulseRect)
+        let pulseShadow = NSShadow()
+        pulseShadow.shadowBlurRadius = 3
+        pulseShadow.shadowOffset = .zero
+        pulseShadow.shadowColor = NSColor.black.withAlphaComponent(alpha * 0.35)
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        pulseShadow.set()
+        NSColor.white.withAlphaComponent(alpha).setStroke()
+        pulse.lineWidth = 2.2 - (0.6 * clickPulseProgress)
+        pulse.stroke()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+}
+
+final class CursorOverlayController: NSObject, NSApplicationDelegate {
+    private let cursorSize = CursorView.canvasSize
+    private let hotSpot = CursorView.effectiveHotSpot
+    private let visibilityAnimationDuration = 0.12
+    private let clickPressDuration = 0.05
+    private let clickPulseDuration = 0.2
+    private var window: NSWindow!
+    private var view: CursorView!
+    private var timer: Timer?
+    private var lastState: CursorState?
+    private var animationStart = CGPoint.zero
+    private var animationTarget = CGPoint.zero
+    private var animationStartTime = CACurrentMediaTime()
+    private var animationDuration = 0.0
+    private var currentPoint = CGPoint.zero
+    private var clickPulseStartTime: CFTimeInterval?
+    private var currentVisibility = 0.0
+    private var visibilityFrom = 0.0
+    private var visibilityTo = 0.0
+    private var visibilityStartTime = CACurrentMediaTime()
+    private var shouldTerminateAfterHide = false
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        let frame = CGRect(origin: .zero, size: cursorSize)
+        window = NSPanel(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true
+        window.level = .normal
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        window.hidesOnDeactivate = false
+        window.alphaValue = 0.0
+
+        view = CursorView(frame: frame)
+        window.contentView = view
+        window.orderOut(nil)
+
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        RunLoop.main.add(timer!, forMode: .common)
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handlePulseNotification),
+            name: Notification.Name("macos-bg-cua.cursor-pulse"),
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleStopNotification),
+            name: Notification.Name("macos-bg-cua.cursor-stop"),
+            object: nil
+        )
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        DistributedNotificationCenter.default().removeObserver(self)
+        removeCursorSessionFiles()
+    }
+
+    @objc private func handlePulseNotification() {
+        pulseClick()
+    }
+
+    @objc private func handleStopNotification() {
+        shouldTerminateAfterHide = true
+        beginVisibilityAnimation(to: 0.0)
+    }
+
+    private func beginVisibilityAnimation(to target: Double) {
+        visibilityFrom = currentVisibility
+        visibilityTo = target
+        visibilityStartTime = CACurrentMediaTime()
+    }
+
+    private func updateVisibility(now: CFTimeInterval) {
+        let elapsed = min(max((now - visibilityStartTime) / visibilityAnimationDuration, 0), 1)
+        let eased = 1 - pow(1 - elapsed, 3)
+        currentVisibility = visibilityFrom + (visibilityTo - visibilityFrom) * eased
+        window.alphaValue = currentVisibility
+
+        if currentVisibility <= 0.001 {
+            view.clickPulseProgress = -1
+            window.orderOut(nil)
+            if shouldTerminateAfterHide {
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
+    private func tick() {
+        let now = CACurrentMediaTime()
+        if let state = try? readCursorState(), state != lastState {
+            lastState = state
+            if state.visible, let (point, _) = try? mousePointForCursorState(state) {
+                animationStart = currentPoint == .zero ? point : currentPoint
+                animationTarget = point
+                animationStartTime = now
+                animationDuration = max(state.duration, 0)
+            }
+            let targetVisibility = state.visible ? 1.0 : 0.0
+            if abs(visibilityTo - targetVisibility) > 0.001 {
+                shouldTerminateAfterHide = false
+                beginVisibilityAnimation(to: targetVisibility)
+            }
+        }
+
+        guard let state = lastState else {
+            beginVisibilityAnimation(to: 0.0)
+            updateVisibility(now: now)
+            return
+        }
+
+        updateVisibility(now: now)
+        guard state.visible, currentVisibility > 0.001 else {
+            return
+        }
+
+        guard let (resolvedPoint, targetWid) = try? mousePointForCursorState(state) else {
+            beginVisibilityAnimation(to: 0.0)
+            updateVisibility(now: now)
+            return
+        }
+
+        if animationDuration <= 0 {
+            currentPoint = resolvedPoint
+        } else {
+            let elapsed = now - animationStartTime
+            let t = min(max(elapsed / animationDuration, 0), 1)
+            let eased = 1 - pow(1 - t, 3)
+            currentPoint = CGPoint(
+                x: animationStart.x + (animationTarget.x - animationStart.x) * eased,
+                y: animationStart.y + (animationTarget.y - animationStart.y) * eased
+            )
+            if t >= 1 {
+                animationDuration = 0
+                currentPoint = resolvedPoint
+            }
+        }
+
+        if resolvedPoint != animationTarget, animationDuration == 0 {
+            currentPoint = resolvedPoint
+        }
+
+        let origin = CGPoint(x: currentPoint.x - hotSpot.x, y: currentPoint.y - hotSpot.y)
+        window.setFrameOrigin(origin)
+
+        if let clickPulseStartTime {
+            let elapsed = now - clickPulseStartTime
+            if elapsed < clickPressDuration {
+                view.pressed = true
+                view.clickPulseProgress = -1
+            } else if elapsed < clickPressDuration + clickPulseDuration {
+                view.pressed = false
+                view.clickPulseProgress = CGFloat((elapsed - clickPressDuration) / clickPulseDuration)
+            } else {
+                view.pressed = false
+                view.clickPulseProgress = -1
+                self.clickPulseStartTime = nil
+            }
+        } else {
+            view.pressed = false
+        }
+
+        if let targetWid {
+            window.level = .normal
+            window.order(.above, relativeTo: Int(targetWid))
+        } else {
+            window.level = .statusBar
+            window.orderFrontRegardless()
+        }
+    }
+
+    func pulseClick() {
+        clickPulseStartTime = CACurrentMediaTime()
+        view.clickPulseProgress = 0
+    }
+}
+
+func runCursorDaemon() throws {
+    try ensureCursorSessionDirectory()
+    try writeCursorPID(getpid())
+    let app = NSApplication.shared
+    let delegate = CursorOverlayController()
+    app.delegate = delegate
+    app.run()
 }
 
 func toGlobal(bounds: CGRect, x: CGFloat, y: CGFloat, coord: CoordMode) -> CGPoint {
@@ -548,7 +957,7 @@ func click(wid: CGWindowID, x: CGFloat, y: CGFloat, coord: CoordMode, hold: usec
     let (pid, app, bounds) = try attach(wid)
     let point = toGlobal(bounds: bounds, x: x, y: y, coord: coord)
     let element = hitTest(app: app, x: point.x, y: point.y)
-    let (plan, target, role) = planClick(element)
+    let (plan, target, role) = planClick(element, point: point)
 
     switch plan {
     case .focusText:
@@ -689,13 +1098,24 @@ func displayPoint(x: CGFloat, y: CGFloat, coord: CoordMode) -> CGPoint {
     toGlobal(bounds: mainDisplayBounds(), x: x, y: y, coord: coord)
 }
 
+func desktopFrameAppKit() -> CGRect {
+    NSScreen.screens.reduce(CGRect.null) { partial, screen in
+        partial.union(screen.frame)
+    }
+}
+
+func quartzToAppKitPoint(_ point: CGPoint) -> CGPoint {
+    let desktop = desktopFrameAppKit()
+    return CGPoint(x: point.x, y: desktop.maxY - point.y)
+}
+
 func typeText(wid: CGWindowID, text: String, at: (CGFloat, CGFloat)?, coord: CoordMode, replace: Bool) throws -> String {
     let (pid, app, bounds) = try attach(wid)
     var target: AXUIElement?
     if let at {
         let point = toGlobal(bounds: bounds, x: at.0, y: at.1, coord: coord)
         let element = hitTest(app: app, x: point.x, y: point.y)
-        let (plan, targetElement, _) = planClick(element)
+        let (plan, targetElement, _) = planClick(element, point: point)
         if plan == .focusText {
             _ = axSet(targetElement, kAXFocusedAttribute as CFString, true)
             target = targetElement
@@ -962,6 +1382,149 @@ func parsePressModifiers(cursor: inout ArgumentCursor) throws -> [String] {
     return modifiers
 }
 
+func parseCursorMoveOptions(cursor: inout ArgumentCursor, defaultDuration: Double = 0.18) throws -> (Double, CoordMode?) {
+    var duration = defaultDuration
+    var coord: CoordMode?
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        switch arg {
+        case "--duration":
+            duration = Double(try cursor.popDouble())
+        case "--coord":
+            let raw = try cursor.pop()
+            guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
+            coord = parsed
+        default:
+            throw CUAError.usage("unknown cursor option: \(arg)")
+        }
+    }
+    return (duration, coord)
+}
+
+func printCursorStatus() throws {
+    let state = try readCursorState()
+    let pid = readCursorPID()
+    try printJSON([
+        "running": pid.map(isProcessAlive) ?? false,
+        "pid": pid.map(Int.init) ?? NSNull(),
+        "mode": state.mode.rawValue,
+        "wid": state.wid ?? NSNull(),
+        "x": state.x,
+        "y": state.y,
+        "coord": state.coord,
+        "duration": state.duration,
+        "visible": state.visible
+    ])
+}
+
+func notifyCursorClickPulse() {
+    DistributedNotificationCenter.default().post(name: Notification.Name("macos-bg-cua.cursor-pulse"), object: nil)
+}
+
+func notifyCursorStop() {
+    DistributedNotificationCenter.default().post(name: Notification.Name("macos-bg-cua.cursor-stop"), object: nil)
+}
+
+func runCursorCommand(cursor: inout ArgumentCursor) throws {
+    guard !cursor.args.isEmpty else { throw CUAError.usage("cursor needs a command") }
+    let command = try cursor.pop()
+    switch command {
+    case "start":
+        guard !cursor.args.isEmpty else { throw CUAError.usage("cursor start needs a mode") }
+        let rawMode = try cursor.pop()
+        guard let mode = CursorTargetMode(rawValue: rawMode) else {
+            throw CUAError.usage("unknown cursor mode: \(rawMode)")
+        }
+
+        var wid: Int?
+        switch mode {
+        case .background:
+            wid = Int(try cursor.popWindowID())
+        case .foregroundApp, .foregroundDesktop:
+            break
+        }
+
+        let x = Double(try cursor.popDouble())
+        let y = Double(try cursor.popDouble())
+        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
+        let coord = overrideCoord ?? .pixel
+        try writeCursorState(CursorState(
+            mode: mode,
+            wid: wid,
+            x: x,
+            y: y,
+            coord: coord.rawValue,
+            duration: duration,
+            visible: true,
+            updatedAt: Date().timeIntervalSince1970
+        ))
+        let pid = try spawnCursorDaemonIfNeeded()
+        try printJSON(["ok": true, "pid": Int(pid), "mode": mode.rawValue, "wid": (wid as Any?) ?? NSNull()])
+    case "move":
+        var state = try readCursorState()
+        state.x = Double(try cursor.popDouble())
+        state.y = Double(try cursor.popDouble())
+        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor)
+        state.duration = duration
+        if let overrideCoord { state.coord = overrideCoord.rawValue }
+        state.visible = true
+        state.updatedAt = Date().timeIntervalSince1970
+        try writeCursorState(state)
+        try printJSON(["ok": true])
+    case "retarget":
+        var state = try readCursorState()
+        guard !cursor.args.isEmpty else { throw CUAError.usage("cursor retarget needs a mode") }
+        let rawMode = try cursor.pop()
+        guard let mode = CursorTargetMode(rawValue: rawMode) else {
+            throw CUAError.usage("unknown cursor mode: \(rawMode)")
+        }
+        state.mode = mode
+        switch mode {
+        case .background:
+            state.wid = Int(try cursor.popWindowID())
+        case .foregroundApp, .foregroundDesktop:
+            state.wid = nil
+        }
+        let (duration, overrideCoord) = try parseCursorMoveOptions(cursor: &cursor, defaultDuration: 0.0)
+        state.duration = duration
+        if let overrideCoord { state.coord = overrideCoord.rawValue }
+        state.updatedAt = Date().timeIntervalSince1970
+        try writeCursorState(state)
+        try printJSON(["ok": true, "mode": state.mode.rawValue, "wid": (state.wid as Any?) ?? NSNull()])
+    case "hide":
+        var state = try readCursorState()
+        state.visible = false
+        state.updatedAt = Date().timeIntervalSince1970
+        try writeCursorState(state)
+        try printJSON(["ok": true])
+    case "show":
+        var state = try readCursorState()
+        state.visible = true
+        state.updatedAt = Date().timeIntervalSince1970
+        try writeCursorState(state)
+        try printJSON(["ok": true])
+    case "click":
+        notifyCursorClickPulse()
+        try printJSON(["ok": true])
+    case "status":
+        try printCursorStatus()
+    case "stop":
+        if let pid = readCursorPID(), isProcessAlive(pid) {
+            if var state = try? readCursorState() {
+                state.visible = false
+                state.updatedAt = Date().timeIntervalSince1970
+                try? writeCursorState(state)
+            }
+            notifyCursorStop()
+        } else {
+            removeCursorSessionFiles()
+        }
+        try printJSON(["ok": true])
+    default:
+        throw CUAError.usage("unknown cursor command: \(command)")
+    }
+}
+
 func inferredScreenshotPath(prefix: String, format: String) -> String {
     "/tmp/\(prefix).\(format == "png" ? "png" : "jpg")"
 }
@@ -1169,6 +1732,7 @@ func usage() -> String {
       macos-bg-cua list-windows
       macos-bg-cua list-windows [--app NAME] [--bundle-id ID] [--pid PID]
       macos-bg-cua active-window
+      macos-bg-cua cursor <command> ...
       macos-bg-cua background <command> ...
       macos-bg-cua foreground-app <command> ...
       macos-bg-cua foreground-desktop <command> ...
@@ -1244,6 +1808,9 @@ func usage() -> String {
                      preferred because it handles Unicode and does not depend on
                      keyboard layout. Falls back to ASCII CG keystrokes.
       press/hotkey   Sends US-keyboard virtual-key events to the target PID.
+      cursor         Runs a persistent visual overlay cursor. In background mode,
+                     it is ordered relative to the target window so overlapping
+                     front windows should cover it while the target app is behind.
 
     permissions:
       Accessibility is required for AX actions and most input reliability.
@@ -1256,6 +1823,12 @@ func usage() -> String {
       macos-bg-cua list-windows --bundle-id net.imput.helium
       macos-bg-cua list-windows --app Helium
       macos-bg-cua active-window
+      macos-bg-cua cursor start background 12345 240 180
+      macos-bg-cua cursor move 400 320 --duration 0.25
+      macos-bg-cua cursor retarget foreground-app
+      macos-bg-cua cursor click
+      macos-bg-cua cursor hide
+      macos-bg-cua cursor stop
       macos-bg-cua screenshot 12345 --png -o /tmp/app.png
       macos-bg-cua foreground-app screenshot --png -o /tmp/front.png
       macos-bg-cua foreground-desktop screenshot --png -o /tmp/screen.png
@@ -1286,10 +1859,14 @@ func run(_ arguments: [String]) throws {
     let command = try cursor.pop()
 
     switch command {
+    case "cursor-daemon":
+        try runCursorDaemon()
     case "help", "--help", "-h":
         print(usage())
     case "active-window":
         try printJSON(listWindows(filter: AppFilter(pid: try frontmostApp().processIdentifier)).first ?? frontmostWindow().jsonObject)
+    case "cursor":
+        try runCursorCommand(cursor: &cursor)
     case "background":
         try runBackgroundSubcommand(cursor: &cursor)
     case "foreground-app":
