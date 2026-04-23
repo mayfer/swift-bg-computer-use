@@ -350,6 +350,18 @@ enum CoordMode: String {
     case global
 }
 
+enum ModeCommand: String {
+    case screenshot
+    case click
+    case rightClick = "right-click"
+    case doubleClick = "double-click"
+    case drag
+    case scroll
+    case type
+    case press
+    case hotkey
+}
+
 func toGlobal(bounds: CGRect, x: CGFloat, y: CGFloat, coord: CoordMode) -> CGPoint {
     switch coord {
     case .global:
@@ -359,6 +371,75 @@ func toGlobal(bounds: CGRect, x: CGFloat, y: CGFloat, coord: CoordMode) -> CGPoi
     case .pixel:
         return CGPoint(x: bounds.origin.x + x, y: bounds.origin.y + y)
     }
+}
+
+func mainDisplayBounds() -> CGRect {
+    CGDisplayBounds(CGMainDisplayID())
+}
+
+func screenInfo() -> [String: Any] {
+    let bounds = mainDisplayBounds()
+    return [
+        "displayID": Int(CGMainDisplayID()),
+        "x": Int(bounds.origin.x),
+        "y": Int(bounds.origin.y),
+        "width": Int(bounds.width),
+        "height": Int(bounds.height)
+    ]
+}
+
+func frontmostApp() throws -> NSRunningApplication {
+    guard let app = NSWorkspace.shared.frontmostApplication else {
+        throw CUAError.usage("no frontmost application")
+    }
+    return app
+}
+
+func axWindowBounds(_ window: AXUIElement?) -> CGRect? {
+    guard let window,
+          let positionValue = axGet(window, kAXPositionAttribute as CFString) as! AXValue?,
+          let sizeValue = axGet(window, kAXSizeAttribute as CFString) as! AXValue? else {
+        return nil
+    }
+    var position = CGPoint.zero
+    var size = CGSize.zero
+    guard AXValueGetValue(positionValue, .cgPoint, &position),
+          AXValueGetValue(sizeValue, .cgSize, &size) else {
+        return nil
+    }
+    return CGRect(origin: position, size: size)
+}
+
+func rectDistanceSquared(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+    let dx = lhs.origin.x - rhs.origin.x
+    let dy = lhs.origin.y - rhs.origin.y
+    let dw = lhs.size.width - rhs.size.width
+    let dh = lhs.size.height - rhs.size.height
+    return dx * dx + dy * dy + dw * dw + dh * dh
+}
+
+func frontmostWindow() throws -> WindowInfo {
+    let app = try frontmostApp()
+    let pid = app.processIdentifier
+    let appAX = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(appAX, 2.0)
+
+    let focusedWindow = axGet(appAX, kAXFocusedWindowAttribute as CFString) as! AXUIElement?
+    let mainWindow = axGet(appAX, kAXMainWindowAttribute as CFString) as! AXUIElement?
+    let targetBounds = axWindowBounds(focusedWindow) ?? axWindowBounds(mainWindow)
+
+    let candidates = allWindows().filter { $0.layer == 0 && $0.pid == pid }
+    guard !candidates.isEmpty else {
+        throw CUAError.usage("no layer-0 window found for frontmost app \(app.localizedName ?? "")")
+    }
+
+    if let targetBounds {
+        if let exact = candidates.min(by: { rectDistanceSquared($0.bounds, targetBounds) < rectDistanceSquared($1.bounds, targetBounds) }) {
+            return exact
+        }
+    }
+
+    return candidates[0]
 }
 
 func frontmostPID() -> pid_t? {
@@ -380,6 +461,14 @@ func guardAndRestore(targetPID: pid_t, work: () -> Void) {
 
 func mouseEvent(_ type: CGEventType, point: CGPoint, button: CGMouseButton) -> CGEvent? {
     CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button)
+}
+
+func globalMouseEvent(_ type: CGEventType, point: CGPoint, button: CGMouseButton) {
+    mouseEvent(type, point: point, button: button)?.post(tap: .cghidEventTap)
+}
+
+func globalScroll(dx: CGFloat, dy: CGFloat) {
+    CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(dy), wheel2: Int32(dx), wheel3: 0)?.post(tap: .cghidEventTap)
 }
 
 func cgMouseDown(pid: pid_t, point: CGPoint, button: CGMouseButton = .left) {
@@ -406,6 +495,42 @@ func cgKey(pid: pid_t, keycode: CGKeyCode, down: Bool, flags: CGEventFlags = [])
     event.postToPid(pid)
 }
 
+func globalKey(keycode: CGKeyCode, down: Bool, flags: CGEventFlags = []) {
+    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keycode, keyDown: down) else { return }
+    event.flags = flags
+    event.post(tap: .cghidEventTap)
+}
+
+func writeImage(_ image: CGImage, path: String, format: String, quality: CGFloat) throws {
+    let rep = NSBitmapImageRep(cgImage: image)
+    let data: Data?
+    if format == "png" {
+        data = rep.representation(using: .png, properties: [:])
+    } else {
+        data = rep.representation(using: .jpeg, properties: [.compressionFactor: quality])
+    }
+    guard let data else {
+        throw CUAError.imageWriteFailed(path)
+    }
+    do {
+        try data.write(to: URL(fileURLWithPath: path))
+    } catch {
+        throw CUAError.imageWriteFailed(path)
+    }
+}
+
+func screenshotDisplay(path: String, format: String, quality: CGFloat) throws {
+    guard let image = CGWindowListCreateImage(
+        mainDisplayBounds(),
+        .optionOnScreenOnly,
+        kCGNullWindowID,
+        [.boundsIgnoreFraming, .nominalResolution]
+    ) else {
+        throw CUAError.imageWriteFailed(path)
+    }
+    try writeImage(image, path: path, format: format, quality: quality)
+}
+
 func screenshot(wid: CGWindowID, path: String, format: String, quality: CGFloat) throws {
     let window = try getWindow(wid)
     guard let image = CGWindowListCreateImage(
@@ -416,19 +541,7 @@ func screenshot(wid: CGWindowID, path: String, format: String, quality: CGFloat)
     ) else {
         throw CUAError.screenshotFailed(wid)
     }
-
-    let url = URL(fileURLWithPath: path)
-    let type = format == "png" ? UTType.png.identifier as CFString : UTType.jpeg.identifier as CFString
-    guard let destination = CGImageDestinationCreateWithURL(url as CFURL, type, 1, nil) else {
-        throw CUAError.imageWriteFailed(path)
-    }
-    let properties: CFDictionary? = format == "jpeg"
-        ? [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary
-        : nil
-    CGImageDestinationAddImage(destination, image, properties)
-    guard CGImageDestinationFinalize(destination) else {
-        throw CUAError.imageWriteFailed(path)
-    }
+    try writeImage(image, path: path, format: format, quality: quality)
 }
 
 func click(wid: CGWindowID, x: CGFloat, y: CGFloat, coord: CoordMode, hold: useconds_t = 50_000) throws -> [String: Any] {
@@ -572,6 +685,10 @@ func flagsFor(_ modifiers: [String]) -> CGEventFlags {
     }
 }
 
+func displayPoint(x: CGFloat, y: CGFloat, coord: CoordMode) -> CGPoint {
+    toGlobal(bounds: mainDisplayBounds(), x: x, y: y, coord: coord)
+}
+
 func typeText(wid: CGWindowID, text: String, at: (CGFloat, CGFloat)?, coord: CoordMode, replace: Bool) throws -> String {
     let (pid, app, bounds) = try attach(wid)
     var target: AXUIElement?
@@ -656,6 +773,77 @@ func pressKey(wid: CGWindowID, key: String, modifiers: [String]) throws -> [Stri
     return ["ok": true]
 }
 
+func clickGlobal(x: CGFloat, y: CGFloat, coord: CoordMode, hold: useconds_t = 50_000) -> [String: Any] {
+    let point = displayPoint(x: x, y: y, coord: coord)
+    globalMouseEvent(.leftMouseDown, point: point, button: .left)
+    usleep(hold)
+    globalMouseEvent(.leftMouseUp, point: point, button: .left)
+    return ["plan": "global", "ok": true]
+}
+
+func rightClickGlobal(x: CGFloat, y: CGFloat, coord: CoordMode) -> [String: Any] {
+    let point = displayPoint(x: x, y: y, coord: coord)
+    globalMouseEvent(.rightMouseDown, point: point, button: .right)
+    usleep(50_000)
+    globalMouseEvent(.rightMouseUp, point: point, button: .right)
+    return ["plan": "global", "ok": true]
+}
+
+func doubleClickGlobal(x: CGFloat, y: CGFloat, coord: CoordMode) -> [String: Any] {
+    _ = clickGlobal(x: x, y: y, coord: coord)
+    usleep(80_000)
+    _ = clickGlobal(x: x, y: y, coord: coord)
+    return ["plan": "double", "ok": true]
+}
+
+func dragGlobal(x1: CGFloat, y1: CGFloat, x2: CGFloat, y2: CGFloat, coord: CoordMode, steps: Int, duration: Double) -> [String: Any] {
+    let start = displayPoint(x: x1, y: y1, coord: coord)
+    let end = displayPoint(x: x2, y: y2, coord: coord)
+    let count = max(steps, 1)
+    globalMouseEvent(.leftMouseDown, point: start, button: .left)
+    for i in 1...count {
+        let t = CGFloat(i) / CGFloat(count)
+        let point = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
+        globalMouseEvent(.leftMouseDragged, point: point, button: .left)
+        usleep(useconds_t((duration / Double(count)) * 1_000_000))
+    }
+    globalMouseEvent(.leftMouseUp, point: end, button: .left)
+    return ["ok": true]
+}
+
+func scrollGlobal(dx: CGFloat, dy: CGFloat) -> [String: Any] {
+    globalScroll(dx: dx, dy: dy)
+    return ["via": "cg"]
+}
+
+func typeGlobal(text: String, at: (CGFloat, CGFloat)?, coord: CoordMode) throws -> [String: Any] {
+    if let at {
+        _ = clickGlobal(x: at.0, y: at.1, coord: coord)
+        usleep(80_000)
+    }
+    for character in text {
+        guard let (code, needsShift) = keycodeForCharacter(character) else { continue }
+        let flags: CGEventFlags = needsShift ? .maskShift : []
+        globalKey(keycode: code, down: true, flags: flags)
+        globalKey(keycode: code, down: false, flags: flags)
+    }
+    return ["via": "cg"]
+}
+
+func pressGlobal(key: String, modifiers: [String]) throws -> [String: Any] {
+    var mods = modifiers
+    var code = keyboard[key]
+    if code == nil, key.count == 1, let result = keycodeForCharacter(Character(key)) {
+        code = result.0
+        if result.1 { mods.append("shift") }
+    }
+    guard let code else { throw CUAError.unknownKey(key) }
+    let flags = flagsFor(mods)
+    globalKey(keycode: code, down: true, flags: flags)
+    globalKey(keycode: code, down: false, flags: flags)
+    return ["ok": true]
+}
+
 struct ArgumentCursor {
     var args: [String]
 
@@ -700,18 +888,290 @@ struct ArgumentCursor {
     }
 }
 
+func parseScreenshotOptions(cursor: inout ArgumentCursor) throws -> (String?, String, CGFloat) {
+    var output: String?
+    var format = "jpeg"
+    var quality: CGFloat = 0.8
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        switch arg {
+        case "-o", "--out":
+            output = try cursor.pop()
+        case "--png":
+            format = "png"
+        case "--quality":
+            quality = CGFloat(try cursor.popDouble())
+        default:
+            throw CUAError.usage("unknown screenshot option: \(arg)")
+        }
+    }
+    return (output, format, quality)
+}
+
+func parseTypeOptions(cursor: inout ArgumentCursor) throws -> ((CGFloat, CGFloat)?, Bool, CoordMode) {
+    var at: (CGFloat, CGFloat)?
+    var replace = false
+    var coord = CoordMode.pixel
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        switch arg {
+        case "--at":
+            at = (try cursor.popDouble(), try cursor.popDouble())
+        case "--replace":
+            replace = true
+        case "--coord":
+            let raw = try cursor.pop()
+            guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
+            coord = parsed
+        default:
+            throw CUAError.usage("unknown type option: \(arg)")
+        }
+    }
+    return (at, replace, coord)
+}
+
+func parseDragOptions(cursor: inout ArgumentCursor) throws -> (Double, Int, CoordMode) {
+    var duration = 0.3
+    var steps = 20
+    var coord = CoordMode.pixel
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        switch arg {
+        case "--duration":
+            duration = Double(try cursor.popDouble())
+        case "--steps":
+            steps = try cursor.popInt()
+        case "--coord":
+            let raw = try cursor.pop()
+            guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
+            coord = parsed
+        default:
+            throw CUAError.usage("unknown drag option: \(arg)")
+        }
+    }
+    return (duration, steps, coord)
+}
+
+func parsePressModifiers(cursor: inout ArgumentCursor) throws -> [String] {
+    var modifiers: [String] = []
+    while !cursor.args.isEmpty {
+        let arg = try cursor.pop()
+        guard arg == "--mod" else { throw CUAError.usage("unknown press option: \(arg)") }
+        modifiers.append(try cursor.pop())
+    }
+    return modifiers
+}
+
+func inferredScreenshotPath(prefix: String, format: String) -> String {
+    "/tmp/\(prefix).\(format == "png" ? "png" : "jpg")"
+}
+
+func runBackgroundSubcommand(cursor: inout ArgumentCursor) throws {
+    guard !cursor.args.isEmpty else { throw CUAError.usage("background needs a command") }
+    let command = try cursor.pop()
+    switch command {
+    case "screenshot":
+        let wid = try cursor.popWindowID()
+        let (output, format, quality) = try parseScreenshotOptions(cursor: &cursor)
+        let path = output ?? inferredScreenshotPath(prefix: "win-\(wid)", format: format)
+        try screenshot(wid: wid, path: path, format: format, quality: quality)
+        print(path)
+    case "click":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(click(wid: wid, x: x, y: y, coord: coord))
+    case "right-click":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(rightClick(wid: wid, x: x, y: y, coord: coord))
+    case "double-click":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(doubleClick(wid: wid, x: x, y: y, coord: coord))
+    case "drag":
+        let wid = try cursor.popWindowID()
+        let x1 = try cursor.popDouble()
+        let y1 = try cursor.popDouble()
+        let x2 = try cursor.popDouble()
+        let y2 = try cursor.popDouble()
+        let (duration, steps, coord) = try parseDragOptions(cursor: &cursor)
+        try printJSON(drag(wid: wid, x1: x1, y1: y1, x2: x2, y2: y2, coord: coord, steps: steps, duration: duration))
+    case "scroll":
+        let wid = try cursor.popWindowID()
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let dx = try cursor.popDouble()
+        let dy = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(["via": scroll(wid: wid, x: x, y: y, dx: dx, dy: dy, coord: coord)])
+    case "type":
+        let wid = try cursor.popWindowID()
+        let text = try cursor.pop()
+        let (at, replace, coord) = try parseTypeOptions(cursor: &cursor)
+        try printJSON(["via": typeText(wid: wid, text: text, at: at, coord: coord, replace: replace)])
+    case "press":
+        let wid = try cursor.popWindowID()
+        let key = try cursor.pop()
+        let modifiers = try parsePressModifiers(cursor: &cursor)
+        try printJSON(pressKey(wid: wid, key: key, modifiers: modifiers))
+    case "hotkey":
+        let wid = try cursor.popWindowID()
+        guard cursor.args.count >= 1 else { throw CUAError.usage("hotkey needs at least one key") }
+        let keys = cursor.args
+        let key = keys.last!
+        let modifiers = Array(keys.dropLast())
+        try printJSON(pressKey(wid: wid, key: key, modifiers: modifiers))
+    default:
+        throw CUAError.usage("unknown background command: \(command)")
+    }
+}
+
+func runForegroundAppSubcommand(cursor: inout ArgumentCursor) throws {
+    guard !cursor.args.isEmpty else { throw CUAError.usage("foreground-app needs a command") }
+    let command = try cursor.pop()
+    let window = try frontmostWindow()
+    switch command {
+    case "info":
+        var object = window.jsonObject
+        if let app = appForPID(window.pid), let bundleID = app.bundleIdentifier {
+            object["bundleID"] = bundleID
+        }
+        try printJSON(object)
+    case "screenshot":
+        let (output, format, quality) = try parseScreenshotOptions(cursor: &cursor)
+        let path = output ?? inferredScreenshotPath(prefix: "front-window-\(window.wid)", format: format)
+        try screenshot(wid: window.wid, path: path, format: format, quality: quality)
+        print(path)
+    case "click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(click(wid: window.wid, x: x, y: y, coord: coord))
+    case "right-click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(rightClick(wid: window.wid, x: x, y: y, coord: coord))
+    case "double-click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(doubleClick(wid: window.wid, x: x, y: y, coord: coord))
+    case "drag":
+        let x1 = try cursor.popDouble()
+        let y1 = try cursor.popDouble()
+        let x2 = try cursor.popDouble()
+        let y2 = try cursor.popDouble()
+        let (duration, steps, coord) = try parseDragOptions(cursor: &cursor)
+        try printJSON(drag(wid: window.wid, x1: x1, y1: y1, x2: x2, y2: y2, coord: coord, steps: steps, duration: duration))
+    case "scroll":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let dx = try cursor.popDouble()
+        let dy = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(["via": scroll(wid: window.wid, x: x, y: y, dx: dx, dy: dy, coord: coord)])
+    case "type":
+        let text = try cursor.pop()
+        let (at, replace, coord) = try parseTypeOptions(cursor: &cursor)
+        try printJSON(["via": typeText(wid: window.wid, text: text, at: at, coord: coord, replace: replace)])
+    case "press":
+        let key = try cursor.pop()
+        let modifiers = try parsePressModifiers(cursor: &cursor)
+        try printJSON(pressKey(wid: window.wid, key: key, modifiers: modifiers))
+    case "hotkey":
+        guard cursor.args.count >= 1 else { throw CUAError.usage("hotkey needs at least one key") }
+        let keys = cursor.args
+        let key = keys.last!
+        let modifiers = Array(keys.dropLast())
+        try printJSON(pressKey(wid: window.wid, key: key, modifiers: modifiers))
+    default:
+        throw CUAError.usage("unknown foreground-app command: \(command)")
+    }
+}
+
+func runForegroundDesktopSubcommand(cursor: inout ArgumentCursor) throws {
+    guard !cursor.args.isEmpty else { throw CUAError.usage("foreground-desktop needs a command") }
+    let command = try cursor.pop()
+    switch command {
+    case "info":
+        try printJSON(screenInfo())
+    case "screenshot":
+        let (output, format, quality) = try parseScreenshotOptions(cursor: &cursor)
+        let path = output ?? inferredScreenshotPath(prefix: "screen-main", format: format)
+        try screenshotDisplay(path: path, format: format, quality: quality)
+        print(path)
+    case "click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(clickGlobal(x: x, y: y, coord: coord))
+    case "right-click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(rightClickGlobal(x: x, y: y, coord: coord))
+    case "double-click":
+        let x = try cursor.popDouble()
+        let y = try cursor.popDouble()
+        let coord = try cursor.parseCoord()
+        try printJSON(doubleClickGlobal(x: x, y: y, coord: coord))
+    case "drag":
+        let x1 = try cursor.popDouble()
+        let y1 = try cursor.popDouble()
+        let x2 = try cursor.popDouble()
+        let y2 = try cursor.popDouble()
+        let (duration, steps, coord) = try parseDragOptions(cursor: &cursor)
+        try printJSON(dragGlobal(x1: x1, y1: y1, x2: x2, y2: y2, coord: coord, steps: steps, duration: duration))
+    case "scroll":
+        _ = try cursor.popDouble() // x, kept for interface symmetry
+        _ = try cursor.popDouble() // y, kept for interface symmetry
+        let dx = try cursor.popDouble()
+        let dy = try cursor.popDouble()
+        _ = try cursor.parseCoord()
+        try printJSON(scrollGlobal(dx: dx, dy: dy))
+    case "type":
+        let text = try cursor.pop()
+        let (at, _, coord) = try parseTypeOptions(cursor: &cursor)
+        try printJSON(try typeGlobal(text: text, at: at, coord: coord))
+    case "press":
+        let key = try cursor.pop()
+        let modifiers = try parsePressModifiers(cursor: &cursor)
+        try printJSON(pressGlobal(key: key, modifiers: modifiers))
+    case "hotkey":
+        guard cursor.args.count >= 1 else { throw CUAError.usage("hotkey needs at least one key") }
+        let keys = cursor.args
+        let key = keys.last!
+        let modifiers = Array(keys.dropLast())
+        try printJSON(pressGlobal(key: key, modifiers: modifiers))
+    default:
+        throw CUAError.usage("unknown foreground-desktop command: \(command)")
+    }
+}
+
 func usage() -> String {
     """
     macos-bg-cua: background macOS window control for coding agents
 
     This tool lets an agent inspect and operate a target app window without
-    activating it. Start with list-windows, capture the chosen wid, inspect the
+    activating it, or operate the frontmost app / desktop in foreground modes.
+    Start with list-apps or list-windows, capture a screenshot, inspect the
     saved image, then act using coordinates from that image.
 
     usage:
       macos-bg-cua list-apps
       macos-bg-cua list-windows
       macos-bg-cua list-windows [--app NAME] [--bundle-id ID] [--pid PID]
+      macos-bg-cua active-window
+      macos-bg-cua background <command> ...
+      macos-bg-cua foreground-app <command> ...
+      macos-bg-cua foreground-desktop <command> ...
       macos-bg-cua screenshot <wid> [-o path] [--png] [--quality 0.8]
       macos-bg-cua click <wid> <x> <y> [--coord pixel|normalized|global]
       macos-bg-cua right-click <wid> <x> <y> [--coord pixel|normalized|global]
@@ -730,6 +1190,16 @@ func usage() -> String {
       4. Inspect the actual image dimensions, or use width/height from
          list-windows. Those dimensions are the coordinate frame.
       5. Click/type/drag/scroll with x,y measured from the screenshot's top-left.
+
+    modes:
+      background         Operate a specific window id (wid). Coordinates are
+                         window-local. This is the original mode.
+      foreground-app     Operate the frontmost app window. Screenshots are
+                         cropped to the active window bounds, excluding shadow.
+                         Coordinates are window-local unless --coord global.
+      foreground-desktop Operate the main display. Screenshots are full-screen.
+                         Coordinates are display-local pixels or normalized.
+                         Use `info` to get width/height for the current screen.
 
     coordinate modes:
       pixel       Default. x,y are window-local screenshot pixels, top-left
@@ -754,6 +1224,11 @@ func usage() -> String {
       list-windows   Prints JSON windows: pid,wid,width,height,owner,name.
                      Only normal layer-0 app windows are listed. Add filters to
                      get windows for a specific app.
+      active-window  Prints JSON for the frontmost app's current layer-0 window.
+      foreground-app info
+                     Prints JSON for the current frontmost app window.
+      foreground-desktop info
+                     Prints JSON for the main display bounds.
       screenshot     Saves a window image and prints the output path, not JSON.
                      Works for occluded/background windows when Screen Recording
                      permission is granted.
@@ -780,7 +1255,12 @@ func usage() -> String {
       macos-bg-cua list-windows
       macos-bg-cua list-windows --bundle-id net.imput.helium
       macos-bg-cua list-windows --app Helium
+      macos-bg-cua active-window
       macos-bg-cua screenshot 12345 --png -o /tmp/app.png
+      macos-bg-cua foreground-app screenshot --png -o /tmp/front.png
+      macos-bg-cua foreground-desktop screenshot --png -o /tmp/screen.png
+      macos-bg-cua foreground-app click 240 180
+      macos-bg-cua foreground-desktop click 240 180
       macos-bg-cua click 12345 240 180
       macos-bg-cua click 12345 0.25 0.40 --coord normalized
       macos-bg-cua double-click 12345 410 300
@@ -808,6 +1288,14 @@ func run(_ arguments: [String]) throws {
     switch command {
     case "help", "--help", "-h":
         print(usage())
+    case "active-window":
+        try printJSON(listWindows(filter: AppFilter(pid: try frontmostApp().processIdentifier)).first ?? frontmostWindow().jsonObject)
+    case "background":
+        try runBackgroundSubcommand(cursor: &cursor)
+    case "foreground-app":
+        try runForegroundAppSubcommand(cursor: &cursor)
+    case "foreground-desktop":
+        try runForegroundDesktopSubcommand(cursor: &cursor)
     case "list-apps":
         var runningOnly = false
         while !cursor.args.isEmpty {
@@ -837,116 +1325,11 @@ func run(_ arguments: [String]) throws {
         }
         try printJSON(listWindows(filter: filter))
     case "screenshot":
-        let wid = try cursor.popWindowID()
-        var output: String?
-        var format = "jpeg"
-        var quality: CGFloat = 0.8
-        while !cursor.args.isEmpty {
-            let arg = try cursor.pop()
-            switch arg {
-            case "-o", "--out":
-                output = try cursor.pop()
-            case "--png":
-                format = "png"
-            case "--quality":
-                quality = CGFloat(try cursor.popDouble())
-            default:
-                throw CUAError.usage("unknown screenshot option: \(arg)")
-            }
-        }
-        let path = output ?? "/tmp/win-\(wid).\(format == "png" ? "png" : "jpg")"
-        try screenshot(wid: wid, path: path, format: format, quality: quality)
-        print(path)
-    case "click":
-        let wid = try cursor.popWindowID()
-        let x = try cursor.popDouble()
-        let y = try cursor.popDouble()
-        let coord = try cursor.parseCoord()
-        try printJSON(click(wid: wid, x: x, y: y, coord: coord))
-    case "right-click":
-        let wid = try cursor.popWindowID()
-        let x = try cursor.popDouble()
-        let y = try cursor.popDouble()
-        let coord = try cursor.parseCoord()
-        try printJSON(rightClick(wid: wid, x: x, y: y, coord: coord))
-    case "double-click":
-        let wid = try cursor.popWindowID()
-        let x = try cursor.popDouble()
-        let y = try cursor.popDouble()
-        let coord = try cursor.parseCoord()
-        try printJSON(doubleClick(wid: wid, x: x, y: y, coord: coord))
-    case "drag":
-        let wid = try cursor.popWindowID()
-        let x1 = try cursor.popDouble()
-        let y1 = try cursor.popDouble()
-        let x2 = try cursor.popDouble()
-        let y2 = try cursor.popDouble()
-        var duration = 0.3
-        var steps = 20
-        var coord = CoordMode.pixel
-        while !cursor.args.isEmpty {
-            let arg = try cursor.pop()
-            switch arg {
-            case "--duration":
-                duration = Double(try cursor.popDouble())
-            case "--steps":
-                steps = try cursor.popInt()
-            case "--coord":
-                let raw = try cursor.pop()
-                guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
-                coord = parsed
-            default:
-                throw CUAError.usage("unknown drag option: \(arg)")
-            }
-        }
-        try printJSON(drag(wid: wid, x1: x1, y1: y1, x2: x2, y2: y2, coord: coord, steps: steps, duration: duration))
-    case "scroll":
-        let wid = try cursor.popWindowID()
-        let x = try cursor.popDouble()
-        let y = try cursor.popDouble()
-        let dx = try cursor.popDouble()
-        let dy = try cursor.popDouble()
-        let coord = try cursor.parseCoord()
-        try printJSON(["via": scroll(wid: wid, x: x, y: y, dx: dx, dy: dy, coord: coord)])
-    case "type":
-        let wid = try cursor.popWindowID()
-        let text = try cursor.pop()
-        var at: (CGFloat, CGFloat)?
-        var replace = false
-        var coord = CoordMode.pixel
-        while !cursor.args.isEmpty {
-            let arg = try cursor.pop()
-            switch arg {
-            case "--at":
-                at = (try cursor.popDouble(), try cursor.popDouble())
-            case "--replace":
-                replace = true
-            case "--coord":
-                let raw = try cursor.pop()
-                guard let parsed = CoordMode(rawValue: raw) else { throw CUAError.usage("unknown coord mode: \(raw)") }
-                coord = parsed
-            default:
-                throw CUAError.usage("unknown type option: \(arg)")
-            }
-        }
-        try printJSON(["via": typeText(wid: wid, text: text, at: at, coord: coord, replace: replace)])
-    case "press":
-        let wid = try cursor.popWindowID()
-        let key = try cursor.pop()
-        var modifiers: [String] = []
-        while !cursor.args.isEmpty {
-            let arg = try cursor.pop()
-            guard arg == "--mod" else { throw CUAError.usage("unknown press option: \(arg)") }
-            modifiers.append(try cursor.pop())
-        }
-        try printJSON(pressKey(wid: wid, key: key, modifiers: modifiers))
-    case "hotkey":
-        let wid = try cursor.popWindowID()
-        guard cursor.args.count >= 1 else { throw CUAError.usage("hotkey needs at least one key") }
-        let keys = cursor.args
-        let key = keys.last!
-        let modifiers = Array(keys.dropLast())
-        try printJSON(pressKey(wid: wid, key: key, modifiers: modifiers))
+        cursor.args.insert(command, at: 0)
+        try runBackgroundSubcommand(cursor: &cursor)
+    case "click", "right-click", "double-click", "drag", "scroll", "type", "press", "hotkey":
+        cursor.args.insert(command, at: 0)
+        try runBackgroundSubcommand(cursor: &cursor)
     default:
         throw CUAError.usage("unknown command: \(command)\n\(usage())")
     }
