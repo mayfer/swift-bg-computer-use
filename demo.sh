@@ -1,4 +1,5 @@
-
+#!/usr/bin/env bash
+set -euo pipefail
 
  ./.build/release/macos-bg-cua cursor start background 120310 50 50 --duration 0.0
   ./.build/release/macos-bg-cua cursor move 733 531 --duration 1.55 --wait
