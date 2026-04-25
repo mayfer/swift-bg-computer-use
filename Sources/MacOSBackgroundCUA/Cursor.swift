@@ -20,7 +20,15 @@ struct CursorState: Codable, Equatable {
     var updatedAt: Double
 }
 
-let cursorSessionDirectory = "/tmp/macos-bg-cua-cursor"
+func executableSessionTag() -> String {
+    let url = URL(fileURLWithPath: currentExecutablePath())
+    let components = url.pathComponents.suffix(3)
+    let joined = components.joined(separator: "-")
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._"))
+    return joined.unicodeScalars.map { allowed.contains($0) ? String($0) : "_" }.joined()
+}
+
+let cursorSessionDirectory = "/tmp/macos-bg-cua-cursor-\(executableSessionTag())"
 let cursorStatePath = "\(cursorSessionDirectory)/state.json"
 let cursorPIDPath = "\(cursorSessionDirectory)/pid"
 let cursorReadyPath = "\(cursorSessionDirectory)/ready"

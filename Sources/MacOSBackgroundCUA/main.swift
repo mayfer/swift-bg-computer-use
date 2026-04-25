@@ -8,6 +8,8 @@ func run(_ arguments: [String]) throws {
     switch command {
     case "cursor-daemon":
         try runCursorDaemon()
+    case "service":
+        try runServiceSubcommand(cursor: &cursor)
     case "help", "--help", "-h":
         print(usage())
     case "active-window":

@@ -15,18 +15,19 @@ func usage() -> String {
       macos-bg-cua list-windows [--app NAME] [--bundle-id ID] [--pid PID]
       macos-bg-cua active-window
       macos-bg-cua cursor <command> ...
+      macos-bg-cua service <command> ...
       macos-bg-cua background <command> ...
       macos-bg-cua foreground-app <command> ...
       macos-bg-cua foreground-desktop <command> ...
-      macos-bg-cua screenshot <wid> [-o path] [--png] [--quality 0.8]
-      macos-bg-cua click <wid> <x> <y> [--coord pixel|normalized|global]
-      macos-bg-cua right-click <wid> <x> <y> [--coord pixel|normalized|global]
-      macos-bg-cua double-click <wid> <x> <y> [--coord pixel|normalized|global]
-      macos-bg-cua drag <wid> <x1> <y1> <x2> <y2> [--duration 0.3] [--steps 20] [--coord pixel|normalized|global]
-      macos-bg-cua scroll <wid> <x> <y> <dx> <dy> [--coord pixel|normalized|global]
-      macos-bg-cua type <wid> <text> [--at X Y] [--replace] [--coord pixel|normalized|global]
-      macos-bg-cua press <wid> <key> [--mod cmd]...
-      macos-bg-cua hotkey <wid> <mod>... <key>
+      macos-bg-cua screenshot <wid|app> [-o path] [--png] [--quality 0.8] [--any-window]
+      macos-bg-cua click <wid|app> <x> <y> [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua right-click <wid|app> <x> <y> [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua double-click <wid|app> <x> <y> [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua drag <wid|app> <x1> <y1> <x2> <y2> [--duration 0.3] [--steps 20] [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua scroll <wid|app> <x> <y> <dx> <dy> [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua type <wid|app> <text> [--at X Y] [--replace] [--coord pixel|normalized|global] [--any-window]
+      macos-bg-cua press <wid|app> <key> [--mod cmd]... [--any-window]
+      macos-bg-cua hotkey <wid|app> <mod>... <key> [--any-window]
 
     agent loop:
       1. Run list-apps if you need a bundle id or pid.
@@ -38,8 +39,11 @@ func usage() -> String {
       5. Click/type/drag/scroll with x,y measured from the screenshot's top-left.
 
     modes:
-      background         Operate a specific window id (wid). Coordinates are
-                         window-local. This is the original mode.
+      background         Operate a specific window id (wid) or an app name.
+                         If the app has one layer-0 window, it is used directly.
+                         If it has multiple windows, pass an exact wid or add
+                         --any-window to let the tool pick one. Coordinates are
+                         window-local.
       foreground-app     Operate the frontmost app window. Screenshots are
                          cropped to the active window bounds, excluding shadow.
                          Coordinates are window-local unless --coord global.
@@ -70,6 +74,10 @@ func usage() -> String {
       list-windows   Prints JSON windows: pid,wid,width,height,owner,name.
                      Only normal layer-0 app windows are listed. Add filters to
                      get windows for a specific app.
+      background app targeting
+                     Background commands accept either a wid or an app name such
+                     as "Helium". If multiple windows match, the command errors
+                     and prints candidate window ids unless --any-window is used.
       active-window  Prints JSON for the frontmost app's current layer-0 window.
       foreground-app info
                      Prints JSON for the current frontmost app window.
@@ -93,6 +101,23 @@ func usage() -> String {
       cursor         Runs a persistent visual overlay cursor. In background mode,
                      it is ordered relative to the target window so overlapping
                      front windows should cover it while the target app is behind.
+      service        Runs the CLI as a long-running daemon that accepts commands
+                     over a UNIX domain socket at /tmp/macos-bg-cua-service/sock.
+                     `service send <args...>` pipes argv to the daemon, which
+                     executes the same commands as the CLI and returns stdout,
+                     stderr, and an exit code as JSON. The daemon auto-spawns on
+                     first `service send` if not running, auto-hides the cursor
+                     overlay after a short idle period, and stops the cursor
+                     overlay cleanly on `service stop`.
+
+    service commands:
+      service start           Spawn the daemon in the background. Idempotent.
+      service stop            Shut down the daemon and its cursor overlay.
+      service status          JSON status: running pid, socket, cursor state.
+      service send <args>...  Execute argv inside the running daemon.
+      service ping            Round-trip check against the daemon.
+      service run             Run the daemon in the foreground (used internally
+                              by `service start`; useful for launchd supervision).
 
     permissions:
       Accessibility is required for AX actions and most input reliability.
@@ -106,17 +131,26 @@ func usage() -> String {
       macos-bg-cua list-windows --app Helium
       macos-bg-cua active-window
       macos-bg-cua cursor start background 12345 240 180 --duration 0.0
+      macos-bg-cua cursor start background Helium 240 180 --duration 0.0 --any-window
       macos-bg-cua cursor move 400 320 --duration 0.25 --wait
       macos-bg-cua cursor retarget foreground-app --wait
       macos-bg-cua cursor click --wait
       macos-bg-cua cursor hide
       macos-bg-cua cursor stop
+      macos-bg-cua service start
+      macos-bg-cua service send list-windows
+      macos-bg-cua service send cursor start foreground-desktop 400 400
+      macos-bg-cua service send cursor move 700 400 --duration 0.25 --wait
+      macos-bg-cua service status
+      macos-bg-cua service stop
       macos-bg-cua screenshot 12345 --png -o /tmp/app.png
+      macos-bg-cua screenshot Helium --png -o /tmp/helium.png --any-window
       macos-bg-cua foreground-app screenshot --png -o /tmp/front.png
       macos-bg-cua foreground-desktop screenshot --png -o /tmp/screen.png
       macos-bg-cua foreground-app click 240 180
       macos-bg-cua foreground-desktop click 240 180
       macos-bg-cua click 12345 240 180
+      macos-bg-cua click Helium 240 180 --any-window
       macos-bg-cua click 12345 0.25 0.40 --coord normalized
       macos-bg-cua double-click 12345 410 300
       macos-bg-cua right-click 12345 410 300

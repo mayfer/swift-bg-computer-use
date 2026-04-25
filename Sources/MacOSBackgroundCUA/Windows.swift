@@ -100,6 +100,43 @@ func listWindows(filter: AppFilter = AppFilter()) -> [[String: Any]] {
     }
 }
 
+func matchingWindowsForAppTarget(_ target: String) -> [WindowInfo] {
+    allWindows().filter { window in
+        guard window.layer == 0 else { return false }
+        guard let app = appForPID(window.pid) else { return false }
+        return appMatches(app, filter: AppFilter(owner: target, bundleID: nil, pid: nil))
+    }
+}
+
+func describeWindows(_ windows: [WindowInfo]) -> String {
+    windows.map { window in
+        let title = window.name.isEmpty ? "(untitled)" : window.name
+        return "wid=\(window.wid) owner=\(window.owner) title=\(title)"
+    }.joined(separator: "\n")
+}
+
+func resolveWindowTarget(_ target: String, anyWindow: Bool = false) throws -> CGWindowID {
+    if let wid = UInt32(target) {
+        return CGWindowID(wid)
+    }
+
+    let windows = matchingWindowsForAppTarget(target)
+    guard !windows.isEmpty else {
+        throw CUAError.usage("no layer-0 windows found for app \"\(target)\"")
+    }
+    if windows.count == 1 || anyWindow {
+        return windows[0].wid
+    }
+
+    let details = describeWindows(windows)
+    throw CUAError.usage(
+        """
+        app "\(target)" has \(windows.count) windows; use an exact wid or pass --any-window
+        \(details)
+        """
+    )
+}
+
 func listApps(runningOnly: Bool = false) -> [[String: Any]] {
     NSWorkspace.shared.runningApplications
         .filter { app in
